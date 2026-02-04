@@ -372,10 +372,16 @@ sampled dynamics. The reward is keyed by (state, action), so this respects
 the transition structure — no chasing rewards from other states.
 """
 function select_rollout_action(dynamics, state, actions)
+    # Filter out confirmed self-loops if there are alternatives
+    viable = filter(a -> !((state, a) in dynamics.confirmed_selfloops), actions)
+    if isempty(viable)
+        viable = actions
+    end
+
     best_r = -Inf
     best_a = nothing
 
-    for a in actions
+    for a in viable
         key = (state, a)
         if haskey(dynamics.rewards, key)
             r = dynamics.rewards[key]
@@ -389,7 +395,7 @@ function select_rollout_action(dynamics, state, actions)
     if !isnothing(best_a) && best_r > 0
         return best_a
     end
-    return rand(actions)
+    return rand(viable)
 end
 
 """

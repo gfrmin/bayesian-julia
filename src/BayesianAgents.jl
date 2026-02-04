@@ -347,6 +347,9 @@ mutable struct BayesianAgent{W<:World, M<:WorldModel, P<:Planner, A<:StateAbstra
 
     # Observation history: (action, observation_text) for building LLM context
     observation_history::Vector{Tuple{Any, String}}
+
+    # State analysis cache: observation_hash → StateAnalysis
+    state_analysis_cache::Dict{UInt64, Any}
 end
 
 """
@@ -369,7 +372,8 @@ function BayesianAgent(
         Dict{Tuple{Any,Any}, Float64}(),
         Tuple{Sensor, Any, Bool, Int}[],
         0,
-        Tuple{Any, String}[]
+        Tuple{Any, String}[],
+        Dict{UInt64, Any}()
     )
 end
 
@@ -388,6 +392,7 @@ function reset!(agent::BayesianAgent)
     empty!(agent.pending_sensor_queries)
     agent.last_reward_step = 0
     empty!(agent.observation_history)
+    empty!(agent.state_analysis_cache)
     return agent.current_observation
 end
 
@@ -415,6 +420,7 @@ Build rich context string for LLM selection queries. Includes:
 """
 function build_llm_context(agent::BayesianAgent)
     parts = String[]
+    s = agent.current_abstract_state
 
     # Current observation
     push!(parts, format_observation_for_llm(agent.current_observation))
@@ -432,8 +438,41 @@ function build_llm_context(agent::BayesianAgent)
         end
     end
 
+    # Confirmed useless actions from this state (null outcomes)
+    confirmed_useless = String[]
+    for (state, action) in agent.model.confirmed_selfloops
+        if state == s
+            push!(confirmed_useless, "'$action'")
+        end
+    end
+    if !isempty(confirmed_useless)
+        push!(parts, "")
+        push!(parts, "Confirmed useless from this location:")
+        for a in confirmed_useless
+            push!(parts, "  $a (no effect)")
+        end
+    end
+
+    # Globally effective actions: (state, action) pairs with positive average reward anywhere
+    globally_effective = String[]
+    for (key, p) in agent.model.reward_posterior
+        n_obs = Int(p.κ - agent.model.reward_prior.κ)
+        if n_obs > 0 && p.μ > 0.1  # Saw positive rewards
+            action_name = key[2]
+            state_name = key[1]
+            avg_r = round(p.μ, digits=1)
+            push!(globally_effective, "'$action_name' at $state_name → avg reward $avg_r")
+        end
+    end
+    if !isempty(globally_effective)
+        push!(parts, "")
+        push!(parts, "Actions that worked elsewhere:")
+        for e in globally_effective[1:min(5, length(globally_effective))]
+            push!(parts, "  $e")
+        end
+    end
+
     # World model knowledge: what actions have been tried from this state
-    s = agent.current_abstract_state
     tried = String[]
     for (key, p) in agent.model.reward_posterior
         if key[1] == s
@@ -467,7 +506,13 @@ Choose and execute an action via expected utility maximisation.
 function act!(agent::BayesianAgent)
     s = agent.current_abstract_state
     available_actions = actions(agent.world, agent.current_observation)
-    
+
+    # Filter out confirmed self-loops if there are alternatives
+    viable_actions = filter(a -> !is_selfloop(agent.model, s, a), available_actions)
+    if !isempty(viable_actions)
+        available_actions = viable_actions
+    end
+
     # VOI-gated sensor queries
     # Maintain per-action belief P(action helps) — prior is 1/N (most actions don't help)
     n_actions = length(available_actions)
@@ -488,6 +533,27 @@ function act!(agent::BayesianAgent)
         rd = reward_dist(agent.model, s, a)
         mean_reward = Distributions.mean(rd)
         mean_reward + belief
+    end
+
+    # Query state analysis from LLM if beliefs are uncertain
+    for sensor in agent.sensors
+        sensor isa LLMSensor || continue
+
+        obs_hash = hash(extract_observation_text(agent.current_observation))
+        if haskey(agent.state_analysis_cache, obs_hash)
+            current_analysis = agent.state_analysis_cache[obs_hash]
+            apply_state_analysis_priors!(current_analysis, available_actions, action_beliefs, sensor)
+        else
+            # VOI gate: only analyze if beliefs are uncertain
+            max_uncertainty = maximum([min(b, 1-b) for b in values(action_beliefs)]; init=0.0)
+            if max_uncertainty > 0.1
+                context = build_llm_context(agent)
+                current_analysis = query_state_analysis(sensor, context, available_actions)
+                agent.state_analysis_cache[obs_hash] = current_analysis
+                apply_state_analysis_priors!(current_analysis, available_actions, action_beliefs, sensor)
+            end
+        end
+        break  # Only use state analysis from first LLM sensor
     end
 
     for sensor in agent.sensors
@@ -599,6 +665,8 @@ function act!(agent::BayesianAgent)
     # Null-action ground truth: if observation text unchanged, action was unhelpful
     if is_null_outcome(agent.current_observation, obs)
         resolve_null_action_queries!(agent, action)
+        mark_selfloop!(agent.model, s, action)
+        agent.action_belief_cache[(s, action)] = 0.001
     end
 
     # When reward != 0, resolve pending queries with discounted trajectory credit
@@ -718,10 +786,10 @@ end
 
 # Additional exports
 export GridWorld, spawn_food!
-export TabularWorldModel, NormalGammaPosterior, SampledDynamics, sample_dynamics, sample_next_state, get_reward, information_gain
+export TabularWorldModel, NormalGammaPosterior, SampledDynamics, sample_dynamics, sample_next_state, get_reward, information_gain, mark_selfloop!, is_selfloop
 export ThompsonMCTS, MCTSNode, plan_with_priors, select_rollout_action
 export IdentityAbstractor, BisimulationAbstractor, abstraction_summary
-export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome
+export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome, StateAnalysis, query_state_analysis, parse_state_analysis, apply_state_analysis_priors!
 export extract_observation_text, build_llm_context
 export action_features, collect_posteriors, combine_posteriors
 

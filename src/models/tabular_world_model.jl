@@ -61,6 +61,9 @@ mutable struct TabularWorldModel <: WorldModel
 
     # Known states (discovered during interaction)
     known_states::Set{Any}
+
+    # Confirmed self-loops: (state, action) pairs that deterministically produce no change
+    confirmed_selfloops::Set{Tuple{Any,Any}}
 end
 
 """
@@ -92,8 +95,27 @@ function TabularWorldModel(;
         feature_extractor,
         transition_prior,
         prior,
-        Set{Any}()
+        Set{Any}(),
+        Set{Tuple{Any,Any}}()
     )
+end
+
+"""
+    mark_selfloop!(model::TabularWorldModel, s, a)
+
+Mark a (state, action) pair as a confirmed self-loop (deterministic no-op).
+"""
+function mark_selfloop!(model::TabularWorldModel, s, a)
+    push!(model.confirmed_selfloops, (s, a))
+end
+
+"""
+    is_selfloop(model::TabularWorldModel, s, a) → Bool
+
+Check whether a (state, action) pair is a confirmed self-loop.
+"""
+function is_selfloop(model::TabularWorldModel, s, a)
+    return (s, a) in model.confirmed_selfloops
 end
 
 """
@@ -253,6 +275,10 @@ When a feature_extractor is present, combines tabular and feature-level posterio
 via precision-weighted averaging before computing the predictive distribution.
 """
 function reward_dist(model::TabularWorldModel, s, a)
+    if (s, a) in model.confirmed_selfloops
+        return Normal(0.0, 1e-10)
+    end
+
     posteriors = collect_posteriors(model, s, a)
     p = length(posteriors) == 1 ? posteriors[1] : combine_posteriors(posteriors)
 
@@ -288,6 +314,10 @@ function sample_dynamics(model::TabularWorldModel)
     sampled_rewards = Dict{Tuple{Any,Any}, Float64}()
 
     for (key, _) in model.reward_posterior
+        if key in model.confirmed_selfloops
+            sampled_rewards[key] = 0.0
+            continue
+        end
         s, a = key
         posteriors = collect_posteriors(model, s, a)
         p = length(posteriors) == 1 ? posteriors[1] : combine_posteriors(posteriors)
@@ -301,7 +331,8 @@ function sample_dynamics(model::TabularWorldModel)
         sampled_transitions,
         sampled_rewards,
         model.known_states,
-        model.reward_prior
+        model.reward_prior,
+        model.confirmed_selfloops
     )
 end
 
@@ -318,6 +349,7 @@ mutable struct SampledDynamics
     rewards::Dict{Tuple{Any,Any}, Float64}
     known_states::Set{Any}
     reward_prior::NormalGammaPosterior
+    confirmed_selfloops::Set{Tuple{Any,Any}}
 end
 
 """
@@ -330,6 +362,10 @@ the result for consistency within this Thompson sample.
 """
 function sample_next_state(dynamics::SampledDynamics, s, a)
     key = (s, a)
+
+    if key in dynamics.confirmed_selfloops
+        return s
+    end
 
     if !haskey(dynamics.transitions, key)
         # Unknown transition — sample and cache for consistency
@@ -359,6 +395,9 @@ untried actions (exploration) while each sample is internally consistent (cohere
 """
 function get_reward(dynamics::SampledDynamics, s, a)
     key = (s, a)
+    if key in dynamics.confirmed_selfloops
+        return 0.0
+    end
     if haskey(dynamics.rewards, key)
         return dynamics.rewards[key]
     end

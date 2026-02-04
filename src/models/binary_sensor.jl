@@ -318,6 +318,113 @@ function update_reliability!(sensor::LLMSensor, said_yes::Bool, actual::Bool)
 end
 
 # ============================================================================
+# STATE ANALYSIS (extract structured knowledge from game text)
+# ============================================================================
+
+"""
+    StateAnalysis
+
+Structured analysis of the current game state extracted from observation text.
+"""
+struct StateAnalysis
+    visible_objects::Vector{String}
+    current_obstacle::String
+    promising_directions::Vector{String}
+    situation_summary::String
+    confidence::Float64
+end
+
+"""
+    query_state_analysis(sensor::LLMSensor, context::String, actions) → StateAnalysis
+
+Ask the LLM to analyze the current game situation and extract structured information.
+"""
+function query_state_analysis(sensor::LLMSensor, context::String, actions)
+    sensor.n_queries += 1
+
+    action_list = join(["  - $a" for a in actions], "\n")
+
+    prompt = """Analyze this text adventure game situation. Extract structured information.
+
+$context
+
+Available actions:
+$action_list
+
+Respond in EXACTLY this format (one item per line after the label):
+OBJECTS: [comma-separated visible objects or things you can interact with]
+OBSTACLE: [the main challenge or problem you need to solve right now]
+PROMISING: [comma-separated action types that seem relevant to the situation, e.g. 'examine', 'take', 'cast spell', 'open door']
+SUMMARY: [one sentence describing the current situation]
+CONFIDENCE: [number from 0.0 to 1.0 indicating your confidence in this analysis]"""
+
+    response = strip(sensor.llm_client.query(prompt))
+    return parse_state_analysis(response)
+end
+
+"""
+    parse_state_analysis(response::AbstractString) → StateAnalysis
+
+Parse the structured response from state analysis query.
+Robust to malformed output — uses empty lists and 0.5 confidence as fallback.
+"""
+function parse_state_analysis(response::AbstractString)
+    visible_objects = String[]
+    current_obstacle = ""
+    promising_directions = String[]
+    situation_summary = ""
+    confidence = 0.5
+
+    lines = split(response, "\n")
+    for line in lines
+        line = strip(line)
+
+        if startswith(lowercase(line), "objects:")
+            content = strip(line[9:end])
+            visible_objects = [strip(s) for s in split(content, ",") if !isempty(strip(s))]
+        elseif startswith(lowercase(line), "obstacle:")
+            current_obstacle = strip(line[10:end])
+        elseif startswith(lowercase(line), "promising:")
+            content = strip(line[11:end])
+            promising_directions = [strip(s) for s in split(content, ",") if !isempty(strip(s))]
+        elseif startswith(lowercase(line), "summary:")
+            situation_summary = strip(line[9:end])
+        elseif startswith(lowercase(line), "confidence:")
+            try
+                conf_str = strip(line[12:end])
+                confidence = parse(Float64, conf_str)
+                confidence = clamp(confidence, 0.0, 1.0)
+            catch
+                confidence = 0.5
+            end
+        end
+    end
+
+    return StateAnalysis(visible_objects, current_obstacle, promising_directions, situation_summary, confidence)
+end
+
+"""
+    apply_state_analysis_priors!(analysis::StateAnalysis, actions, action_beliefs, sensor)
+
+Apply Bayesian update to action beliefs based on state analysis.
+Promising directions increase action beliefs via the sensor's learned reliability.
+"""
+function apply_state_analysis_priors!(analysis::StateAnalysis, actions, action_beliefs::Dict, sensor)
+    promising_lower = [lowercase(d) for d in analysis.promising_directions]
+
+    for a in actions
+        a_lower = lowercase(string(a))
+        # Check if action matches any promising direction
+        is_promising = any(d -> occursin(d, a_lower) || occursin(a_lower, d), promising_lower)
+
+        if is_promising
+            prior = get(action_beliefs, a, 1.0 / length(actions))
+            action_beliefs[a] = posterior(sensor, prior, true)
+        end
+    end
+end
+
+# ============================================================================
 # SELECTION QUERY (ask LLM to pick best action from a list)
 # ============================================================================
 
