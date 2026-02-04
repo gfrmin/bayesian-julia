@@ -177,12 +177,10 @@ function run_jericho_experiment(;
         else
             println("Ollama connected: $(strip(test_response))")
             # Skeptical prior: uniform Beta(1,1) for both TPR and FPR.
-            # With TPR=0.5, FPR=0.5, posterior updates barely move beliefs —
-            # the LLM has near-zero influence until ground truth calibrates it.
             sensor = LLMSensor("llm", client;
                 prompt_template = "{question}",
-                tp_prior = (1.0, 1.0),
-                fp_prior = (1.0, 1.0))
+                tp_prior = (2.0, 1.0),
+                fp_prior = (1.0, 2.0))
             push!(sensors, sensor)
         end
         println()
