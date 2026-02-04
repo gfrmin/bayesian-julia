@@ -201,12 +201,15 @@ function BayesianAgents.sample_dynamics(model::FactoredWorldModel)
 end
 
 """
-    sample_next_state(model::FactoredWorldModel, s::MinimalState, a::String, sampled::SampledFactoredDynamics) → MinimalState
+    sample_next_state(sampled::SampledFactoredDynamics, s::MinimalState, a::String) → MinimalState
 
 Sample next state from transition distribution under sampled model.
+Interface matches TabularWorldModel for MCTS compatibility.
+
 P(s' | s, a, θ_sampled) = P(location' | location, a, θ) × ∏_obj P(obj ∈ inventory' | obj ∈ inventory, a, θ)
 """
-function sample_next_state(model::FactoredWorldModel, s::MinimalState, a::String, sampled::SampledFactoredDynamics)::MinimalState
+function sample_next_state(sampled::SampledFactoredDynamics, s::MinimalState, a::String)::MinimalState
+    model = sampled.model
     sampled_cpds = sampled.sampled_cpds
 
     if !haskey(sampled_cpds, a)
@@ -246,6 +249,32 @@ function sample_next_state(model::FactoredWorldModel, s::MinimalState, a::String
     end
 
     return MinimalState(new_location, new_inventory)
+end
+
+"""
+    get_reward(sampled::SampledFactoredDynamics, s::MinimalState, a::String) → Float64
+
+Get expected reward for state-action pair under sampled model.
+Interface matches TabularWorldModel for MCTS compatibility.
+"""
+function get_reward(sampled::SampledFactoredDynamics, s::MinimalState, a::String)::Float64
+    model = sampled.model
+    key = (s, a)
+
+    # Check if confirmed self-loop (no learning needed)
+    if key ∈ model.confirmed_selfloops
+        return 0.0
+    end
+
+    # Return posterior mean reward
+    if haskey(model.reward_posterior, key)
+        posterior = model.reward_posterior[key]
+        # Normal-Gamma posterior: mean = μ
+        return posterior.μ
+    end
+
+    # No data for this state-action: return neutral estimate
+    return 0.0
 end
 
 """

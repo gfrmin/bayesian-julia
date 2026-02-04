@@ -493,7 +493,13 @@ function build_llm_context(agent::BayesianAgent)
 
     # Game progress
     push!(parts, "")
-    push!(parts, "Step $(agent.step_count), total reward $(agent.total_reward), $(length(agent.model.known_states)) states discovered")
+    # Count states: works for both TabularWorldModel and FactoredWorldModel
+    n_states = if hasfield(typeof(agent.model), :known_states)
+        length(agent.model.known_states)
+    else
+        length(agent.model.known_locations) + length(agent.model.known_objects)
+    end
+    push!(parts, "Step $(agent.step_count), total reward $(agent.total_reward), $n_states state elements discovered")
 
     return join(parts, "\n")
 end

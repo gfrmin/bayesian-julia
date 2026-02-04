@@ -373,7 +373,13 @@ the transition structure — no chasing rewards from other states.
 """
 function select_rollout_action(dynamics, state, actions)
     # Filter out confirmed self-loops if there are alternatives
-    viable = filter(a -> !((state, a) in dynamics.confirmed_selfloops), actions)
+    # (Works with both SampledDynamics and SampledFactoredDynamics)
+    if hasfield(typeof(dynamics), :confirmed_selfloops)
+        viable = filter(a -> !((state, a) in dynamics.confirmed_selfloops), actions)
+    else
+        # SampledFactoredDynamics: check via model
+        viable = filter(a -> !((state, a) in dynamics.model.confirmed_selfloops), actions)
+    end
     if isempty(viable)
         viable = actions
     end

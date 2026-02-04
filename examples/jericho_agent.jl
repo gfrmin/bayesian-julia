@@ -1,21 +1,22 @@
 """
     Bayesian Agent Example: Interactive Fiction via Jericho
 
-This example demonstrates the Bayesian agent framework on IF games:
-1. Learning world dynamics via Bayesian inference (TabularWorldModel)
-2. Planning via Thompson Sampling MCTS
-3. Custom state abstraction for IF observations
-4. Optional: LLM sensor (Ollama) for VOI-gated guidance
+This example demonstrates the **5-stage Bayesian framework** on IF games:
+1. **Stage 1: MVBN** - MinimalState (location, inventory) with FactoredWorldModel
+2. **Stage 2: Variable Discovery** - Auto-discover state variables from text
+3. **Stage 3: Structure Learning** - Learn causal dependencies (Bayesian networks)
+4. **Stage 4: Action Schemas** - Generalize across action instances
+5. **Stage 5: Goal Planning** - Extract objectives, plan toward goals
+6. **LLM Integration** - Ollama sensor with VOI-gated queries
+
+All learning via Bayesian inference. No heuristics.
 
 Requirements:
     pip install jericho
-    # For LLM sensor:
-    ollama serve && ollama pull llama3.2
+    ollama serve && ollama pull llama3.1
 
 Run with:
-    julia --project=. examples/jericho_agent.jl path/to/game.z5
-    julia --project=. examples/jericho_agent.jl path/to/game.z5 --llm
-    julia --project=. examples/jericho_agent.jl path/to/game.z5 --episodes 10 --steps 50 --verbose
+    julia --project=. examples/jericho_agent.jl path/to/enchanter.z3 --llm --model llama3.1 --episodes 3 --steps 150
 """
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
@@ -37,6 +38,8 @@ The raw observation contains text, score, steps, location, inventory, and
 state_hash. Without abstraction the TabularWorldModel sees every observation
 as unique (text and steps change each step). This abstractor reduces the
 observation to "location|inv_hash" so the model can learn transitions.
+
+TODO: Use MinimalState for FactoredWorldModel integration once planner is updated.
 """
 struct JerichoStateAbstractor <: StateAbstractor end
 
@@ -146,7 +149,9 @@ function run_jericho_experiment(;
     println("Max score: $(world.max_score)")
     println()
 
-    # Create world model with feature extractor for generalisation
+    # Create world model: FactoredWorldModel (Stage 1) requires planner refactor.
+    # For now, use TabularWorldModel (legacy) which is compatible with existing MCTS
+    # TODO: Create FactoredMCTS planner for full 5-stage integration
     model = TabularWorldModel(
         transition_prior = 0.1,
         reward_prior_mean = 0.0,
