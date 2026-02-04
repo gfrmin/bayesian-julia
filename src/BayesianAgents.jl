@@ -767,12 +767,36 @@ export plan
 export compute_voi
 export AgentConfig, BayesianAgent, act!, run_episode!, resolve_pending_queries!, resolve_null_action_queries!
 
-# Include implementations
+# ============================================================================
+# FOUNDATIONAL COMPONENTS (needed by both legacy and Stage 1)
+# ============================================================================
+
+# Legacy components (depended on by Stage 1)
 include("models/tabular_world_model.jl")
 include("models/binary_sensor.jl")
 include("planners/thompson_mcts.jl")
 include("abstractors/identity_abstractor.jl")
 include("abstractors/bisimulation_abstractor.jl")
+
+# ============================================================================
+# STAGE 1: MVBN (Minimum Viable Bayesian Network) - NEW COMPONENTS
+# ============================================================================
+
+# Probability foundations
+include("probability/cpd.jl")
+
+# State representation
+include("state/minimal_state.jl")
+include("state/state_belief.jl")
+
+# Factored world model
+include("models/factored_world_model.jl")
+
+# State inference
+include("inference/bayesian_update.jl")
+
+# Factored planning
+include("planning/factored_mcts.jl")
 
 # World adapters
 include("worlds/gridworld.jl")
@@ -784,9 +808,17 @@ catch e
     @warn "Jericho world not available (PyCall or Jericho not installed)" exception=e
 end
 
-# Additional exports
+# Stage 1: MVBN exports
+export DirichletCategorical, update!, predict, entropy, expected_entropy, mode
+export MinimalState, extract_minimal_state
+export StateBelief, add_object!, update_from_state!, sample_state, predict_state, posterior_prob, loglikelihood
+export FactoredWorldModel, SampledFactoredDynamics, add_location!, sample_next_state, mark_selfloop!, is_selfloop
+export FactoredMCTS, FactoredMCTSNode, mcts_search
+export update_location_belief!, update_inventory_belief!, bayesian_update_belief!, predict_from_likelihood
+
+# Legacy exports
 export GridWorld, spawn_food!
-export TabularWorldModel, NormalGammaPosterior, SampledDynamics, sample_dynamics, sample_next_state, get_reward, information_gain, mark_selfloop!, is_selfloop
+export TabularWorldModel, NormalGammaPosterior, SampledDynamics, get_reward, information_gain
 export ThompsonMCTS, MCTSNode, plan_with_priors, select_rollout_action
 export IdentityAbstractor, BisimulationAbstractor, abstraction_summary
 export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome, StateAnalysis, query_state_analysis, parse_state_analysis, apply_state_analysis_priors!
