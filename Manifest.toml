@@ -2,7 +2,7 @@
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "f99a6d23e2377507061ed1131ab1eaa712ab7864"
+project_hash = "9c60681868972e5513b6cc8015b6ce65b3dc6439"
 
 [[deps.AliasTables]]
 deps = ["PtrArrays", "Random"]
@@ -23,7 +23,7 @@ uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
 
 [[deps.BayesianAgents]]
-deps = ["DataStructures", "Distributions", "LinearAlgebra", "PyCall", "Random", "StatsBase"]
+deps = ["DataStructures", "Distributions", "JSON", "LinearAlgebra", "PyCall", "Random", "StatsBase"]
 path = "."
 uuid = "12345678-1234-1234-1234-123456789abc"
 version = "0.1.0"

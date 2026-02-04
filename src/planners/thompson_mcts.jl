@@ -140,6 +140,41 @@ function plan(planner::ThompsonMCTS, state, model::WorldModel, actions)
 end
 
 """
+    plan_with_priors(planner::ThompsonMCTS, state, model, actions, priors) → action
+
+Plan using Thompson Sampling MCTS with externally provided action priors.
+Used when sensor queries have updated beliefs about which actions are promising.
+"""
+function plan_with_priors(planner::ThompsonMCTS, state, model::WorldModel, actions, priors::Dict)
+    if isempty(actions)
+        error("No actions available")
+    end
+
+    if length(actions) == 1
+        return first(actions)
+    end
+
+    root = MCTSNode(state)
+
+    for _ in 1:planner.iterations
+        sampled_dynamics = sample_dynamics(model)
+        simulate!(planner, root, sampled_dynamics, actions, priors, planner.depth)
+    end
+
+    best_action = nothing
+    best_visits = -1
+
+    for (action, child) in root.children
+        if child.visit_count > best_visits
+            best_visits = child.visit_count
+            best_action = action
+        end
+    end
+
+    return best_action
+end
+
+"""
     simulate!(planner, node, dynamics, actions, priors, depth) → value
 
 Run one simulation from a node using the sampled dynamics.

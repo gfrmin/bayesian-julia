@@ -12,6 +12,7 @@ module BayesianAgents
 using Random
 using Distributions
 using LinearAlgebra
+using Logging
 
 # ============================================================================
 # CORE ABSTRACT TYPES
@@ -349,8 +350,9 @@ function BayesianAgent(
     config::AgentConfig = AgentConfig()
 )
     return BayesianAgent(
-        world, model, planner, abstractor, sensors, config,
-        nothing, nothing, 0, 0, 0.0, []
+        world, model, planner, abstractor, convert(Vector{Sensor}, sensors), config,
+        nothing, nothing, 0, 0, 0.0,
+        NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}[]
     )
 end
 
@@ -378,23 +380,73 @@ function act!(agent::BayesianAgent)
     s = agent.current_abstract_state
     available_actions = actions(agent.world, agent.current_observation)
     
-    # Maybe query sensors (if VOI > cost)
+    # VOI-gated sensor queries
+    # Maintain per-action belief P(action helps) — prior is 1/N (most actions don't help)
+    n_actions = length(available_actions)
+    @debug "act! start" state=s n_actions step=agent.step_count
+
+    action_beliefs = Dict(a => 1.0 / n_actions for a in available_actions)
+
+    # Track queries for ground truth updates: (sensor, action, answer)
+    sensor_queries = Tuple{Sensor, Any, Bool}[]
+
+    # EU function: expected utility of an action given belief that it helps.
+    # Actions believed helpful get a bonus proportional to belief.
+    eu_func = (a, belief) -> begin
+        rd = reward_dist(agent.model, s, a)
+        mean_reward = Distributions.mean(rd)
+        mean_reward + belief
+    end
+
     for sensor in agent.sensors
         queries_made = 0
         while queries_made < agent.config.max_queries_per_step
-            # Find best question to ask (implementation-specific)
-            # For now, skip sensor queries — can be extended
-            break
+            best_voi = 0.0
+            best_action_to_ask = nothing
+
+            for a in available_actions
+                prior = action_beliefs[a]
+                (prior < 0.01 || prior > 0.99) && continue
+
+                voi = compute_voi(sensor, prior, available_actions,
+                    (act, belief) -> eu_func(act, act == a ? belief : action_beliefs[act]))
+
+                if voi > best_voi
+                    best_voi = voi
+                    best_action_to_ask = a
+                end
+            end
+
+            (best_voi <= agent.config.sensor_cost || isnothing(best_action_to_ask)) && break
+
+            question = "Will action \"$(best_action_to_ask)\" help make progress?"
+            answer = query(sensor, s, question)
+
+            action_beliefs[best_action_to_ask] = posterior(
+                sensor, action_beliefs[best_action_to_ask], answer)
+
+            push!(sensor_queries, (sensor, best_action_to_ask, answer))
+            queries_made += 1
+            @debug "sensor query" sensor=sensor.name action=best_action_to_ask answer voi=best_voi belief=action_beliefs[best_action_to_ask]
         end
     end
-    
-    # Plan and select action
-    action = plan(agent.planner, s, agent.model, available_actions)
-    
+
+    # Normalize beliefs as action priors for the planner
+    belief_total = sum(values(action_beliefs))
+    action_priors = if belief_total > 0
+        Dict(a => b / belief_total for (a, b) in action_beliefs)
+    else
+        Dict(a => 1.0 / n_actions for a in available_actions)
+    end
+
+    action = plan_with_priors(agent.planner, s, agent.model, available_actions, action_priors)
+    @debug "action selected" action beliefs=action_beliefs n_sensor_queries=length(sensor_queries)
+
     # Execute action
     obs, reward, done, info = step!(agent.world, action)
     s′ = abstract_state(agent.abstractor, obs)
-    
+    @debug "step result" action reward new_state=s′ done
+
     # Update model
     update!(agent.model, s, action, reward, s′)
     
@@ -407,15 +459,23 @@ function act!(agent::BayesianAgent)
         refine!(agent.abstractor, contradiction)
     end
     
+    # Update sensor reliability from ground truth (reward > 0 means action helped)
+    actually_helped = reward > 0
+    for (sensor, queried_action, said_yes) in sensor_queries
+        if queried_action == action
+            update_reliability!(sensor, said_yes, actually_helped)
+        end
+    end
+
     # Record transition
     push!(agent.trajectory, (s=s, a=action, r=reward, s′=s′))
-    
+
     # Update state
     agent.current_observation = obs
     agent.current_abstract_state = s′
     agent.step_count += 1
     agent.total_reward += reward
-    
+
     return action, obs, reward, done
 end
 
@@ -468,7 +528,7 @@ end
 # Additional exports
 export GridWorld, spawn_food!
 export TabularWorldModel, sample_dynamics, information_gain
-export ThompsonMCTS, MCTSNode
+export ThompsonMCTS, MCTSNode, plan_with_priors
 export IdentityAbstractor, BisimulationAbstractor
 export BinarySensor, LLMSensor
 
