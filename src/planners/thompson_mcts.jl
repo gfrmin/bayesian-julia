@@ -158,7 +158,7 @@ function plan_with_priors(planner::ThompsonMCTS, state, model::WorldModel, actio
 
     for _ in 1:planner.iterations
         sampled_dynamics = sample_dynamics(model)
-        simulate!(planner, root, sampled_dynamics, actions, priors, planner.depth)
+        simulate!(planner, root, sampled_dynamics, actions, priors, planner.depth; use_puct=true)
     end
 
     best_action = nothing
@@ -175,9 +175,13 @@ function plan_with_priors(planner::ThompsonMCTS, state, model::WorldModel, actio
 end
 
 """
-    simulate!(planner, node, dynamics, actions, priors, depth) → value
+    simulate!(planner, node, dynamics, actions, priors, depth; use_puct=false) → value
 
 Run one simulation from a node using the sampled dynamics.
+
+When `use_puct` is true (root level), uses PUCT selection so sensor priors
+persistently influence tree traversal. Recursive calls use plain UCB since
+priors are about current-state actions, not future states.
 """
 function simulate!(
     planner::ThompsonMCTS,
@@ -185,33 +189,39 @@ function simulate!(
     dynamics,
     actions,
     priors::Dict,
-    depth::Int
+    depth::Int;
+    use_puct::Bool = false
 )
     if depth == 0 || node.is_terminal
         return 0.0
     end
-    
-    # Selection: if fully expanded, use UCB to select child
+
+    # Selection: if fully expanded, use PUCT (root) or UCB (deeper)
     if is_expanded(node, actions)
-        action, child = select_ucb(planner, node, actions)
+        action, child = if use_puct
+            select_puct(planner, node, actions, priors)
+        else
+            select_ucb(planner, node, actions)
+        end
+        # Recursive calls always use plain UCB (priors are root-only)
         value = get_reward(dynamics, node.state, action) +
-                planner.discount * simulate!(planner, child, dynamics, actions, priors, depth - 1)
+                planner.discount * simulate!(planner, child, dynamics, actions, priors, depth - 1; use_puct=false)
     else
         # Expansion: add a new child
         action = select_unexpanded(node, actions, priors)
         next_state = sample_next_state(dynamics, node.state, action)
         child = MCTSNode(next_state; parent=node, parent_action=action)
         node.children[action] = child
-        
+
         # Rollout from new child
         value = get_reward(dynamics, node.state, action) +
                 planner.discount * rollout(planner, child, dynamics, actions, depth - 1)
     end
-    
+
     # Backpropagation
     node.visit_count += 1
     node.value_sum += value
-    
+
     return value
 end
 
@@ -224,27 +234,60 @@ function select_ucb(planner::ThompsonMCTS, node::MCTSNode, actions)
     best_action = nothing
     best_child = nothing
     best_ucb = -Inf
-    
+
     log_parent = log(node.visit_count + 1)
-    
+
     for (action, child) in node.children
         if child.visit_count == 0
             # Unvisited child — select immediately
             return action, child
         end
-        
+
         # UCB formula
         exploitation = child.value_sum / child.visit_count
         exploration = planner.ucb_c * sqrt(log_parent / child.visit_count)
         ucb = exploitation + exploration
-        
+
         if ucb > best_ucb
             best_ucb = ucb
             best_action = action
             best_child = child
         end
     end
-    
+
+    return best_action, best_child
+end
+
+"""
+    select_puct(planner, node, actions, priors) → (action, child)
+
+Select a child using PUCT (Predictor + UCB for Trees).
+Uses action priors from sensors to weight exploration:
+    Q(s,a) + c · P(a) · √N_parent / (1 + N(s,a))
+
+This ensures sensor beliefs persistently influence which tree branches
+get explored, not just which actions expand first.
+"""
+function select_puct(planner::ThompsonMCTS, node::MCTSNode, actions, priors::Dict)
+    best_action = nothing
+    best_child = nothing
+    best_score = -Inf
+
+    sqrt_parent = sqrt(node.visit_count + 1)
+
+    for (action, child) in node.children
+        q = child.visit_count > 0 ? child.value_sum / child.visit_count : 0.0
+        p = get(priors, action, 1.0 / length(actions))
+        exploration = planner.ucb_c * p * sqrt_parent / (1 + child.visit_count)
+        score = q + exploration
+
+        if score > best_score
+            best_score = score
+            best_action = action
+            best_child = child
+        end
+    end
+
     return best_action, best_child
 end
 

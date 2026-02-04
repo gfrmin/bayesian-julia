@@ -324,16 +324,20 @@ mutable struct BayesianAgent{W<:World, M<:WorldModel, P<:Planner, A<:StateAbstra
     abstractor::A
     sensors::Vector{Sensor}
     config::AgentConfig
-    
+
     # State
     current_observation::Any
     current_abstract_state::Any
     step_count::Int
     episode_count::Int
     total_reward::Float64
-    
+
     # History for credit assignment
     trajectory::Vector{NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}}
+
+    # Persistent action beliefs: (abstract_state, action) → P(action helps)
+    # Survives across steps and episodes so sensor learning is not lost
+    action_belief_cache::Dict{Tuple{Any,Any}, Float64}
 end
 
 """
@@ -352,7 +356,8 @@ function BayesianAgent(
     return BayesianAgent(
         world, model, planner, abstractor, convert(Vector{Sensor}, sensors), config,
         nothing, nothing, 0, 0, 0.0,
-        NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}[]
+        NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}[],
+        Dict{Tuple{Any,Any}, Float64}()
     )
 end
 
@@ -385,7 +390,11 @@ function act!(agent::BayesianAgent)
     n_actions = length(available_actions)
     @debug "act! start" state=s n_actions step=agent.step_count
 
-    action_beliefs = Dict(a => 1.0 / n_actions for a in available_actions)
+    # Load cached beliefs or default to 1/N
+    action_beliefs = Dict(
+        a => get(agent.action_belief_cache, (s, a), 1.0 / n_actions)
+        for a in available_actions
+    )
 
     # Track queries for ground truth updates: (sensor, action, answer)
     sensor_queries = Tuple{Sensor, Any, Bool}[]
@@ -420,7 +429,7 @@ function act!(agent::BayesianAgent)
             (best_voi <= agent.config.sensor_cost || isnothing(best_action_to_ask)) && break
 
             question = "Will action \"$(best_action_to_ask)\" help make progress?"
-            answer = query(sensor, s, question)
+            answer = query(sensor, agent.current_observation, question)
 
             action_beliefs[best_action_to_ask] = posterior(
                 sensor, action_beliefs[best_action_to_ask], answer)
@@ -429,6 +438,11 @@ function act!(agent::BayesianAgent)
             queries_made += 1
             @debug "sensor query" sensor=sensor.name action=best_action_to_ask answer voi=best_voi belief=action_beliefs[best_action_to_ask]
         end
+    end
+
+    # Persist updated beliefs back to cache
+    for (a, belief) in action_beliefs
+        agent.action_belief_cache[(s, a)] = belief
     end
 
     # Normalize beliefs as action priors for the planner
@@ -441,6 +455,17 @@ function act!(agent::BayesianAgent)
 
     action = plan_with_priors(agent.planner, s, agent.model, available_actions, action_priors)
     @debug "action selected" action beliefs=action_beliefs n_sensor_queries=length(sensor_queries)
+
+    # Post-planning query: if the chosen action wasn't already queried, ask about it
+    # so we get a sensor prediction to compare against ground truth
+    already_queried = any(qa -> qa[2] == action, sensor_queries)
+    if !already_queried && !isempty(agent.sensors)
+        sensor = first(agent.sensors)
+        question = "Will action \"$(action)\" help make progress?"
+        answer = query(sensor, agent.current_observation, question)
+        push!(sensor_queries, (sensor, action, answer))
+        @debug "post-planning query" sensor=sensor.name action answer
+    end
 
     # Execute action
     obs, reward, done, info = step!(agent.world, action)
@@ -530,6 +555,6 @@ export GridWorld, spawn_food!
 export TabularWorldModel, sample_dynamics, information_gain
 export ThompsonMCTS, MCTSNode, plan_with_priors
 export IdentityAbstractor, BisimulationAbstractor
-export BinarySensor, LLMSensor
+export BinarySensor, LLMSensor, format_observation_for_llm
 
 end # module

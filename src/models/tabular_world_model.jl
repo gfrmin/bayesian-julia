@@ -168,7 +168,8 @@ function sample_dynamics(model::TabularWorldModel)
         sampled_transitions,
         sampled_rewards,
         model.known_states,
-        model.reward_prior_mean
+        model.reward_prior_mean,
+        model.reward_prior_variance
     )
 end
 
@@ -176,30 +177,41 @@ end
     SampledDynamics
 
 A sampled world model for use in planning.
+
+Lazily samples from the prior for unknown (s,a) pairs — different across
+Thompson samples (exploration) but consistent within one sample (coherent planning).
 """
-struct SampledDynamics
+mutable struct SampledDynamics
     transitions::Dict{Tuple{Any,Any}, Any}
     rewards::Dict{Tuple{Any,Any}, Float64}
     known_states::Set{Any}
-    default_reward::Float64
+    reward_prior_mean::Float64
+    reward_prior_variance::Float64
 end
 
 """
     sample_next_state(dynamics::SampledDynamics, s, a) → s′
 
 Sample a next state from the sampled dynamics.
+
+For unknown (s,a), samples once (50% self-loop, 50% random known state) and caches
+the result for consistency within this Thompson sample.
 """
 function sample_next_state(dynamics::SampledDynamics, s, a)
     key = (s, a)
-    
+
     if !haskey(dynamics.transitions, key)
-        # Unknown transition — return random known state or same state
-        if isempty(dynamics.known_states)
-            return s
+        # Unknown transition — sample and cache for consistency
+        next = if isempty(dynamics.known_states) || rand() < 0.5
+            s  # Self-loop
+        else
+            rand(collect(dynamics.known_states))
         end
-        return rand(collect(dynamics.known_states))
+        # Cache as a degenerate categorical so future lookups are consistent
+        dynamics.transitions[key] = (states=[next], probs=[1.0])
+        return next
     end
-    
+
     trans = dynamics.transitions[key]
     idx = rand(Categorical(trans.probs))
     return trans.states[idx]
@@ -209,10 +221,20 @@ end
     get_reward(dynamics::SampledDynamics, s, a) → Float64
 
 Get the sampled reward for a state-action pair.
+
+For unknown (s,a), lazily samples from Normal(prior_mean, √prior_var) and caches
+the result. This ensures different Thompson samples see different rewards for
+untried actions (exploration) while each sample is internally consistent (coherent planning).
 """
 function get_reward(dynamics::SampledDynamics, s, a)
     key = (s, a)
-    return get(dynamics.rewards, key, dynamics.default_reward)
+    if haskey(dynamics.rewards, key)
+        return dynamics.rewards[key]
+    end
+    # Sample from prior and cache for consistency within this Thompson sample
+    r = rand(Normal(dynamics.reward_prior_mean, sqrt(dynamics.reward_prior_variance)))
+    dynamics.rewards[key] = r
+    return r
 end
 
 """

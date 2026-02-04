@@ -228,19 +228,41 @@ function LLMSensor(
 end
 
 """
+    format_observation_for_llm(obs) → String
+
+Format an observation for use as LLM context.
+Handles NamedTuples with :text/:location/:inventory/:score fields (e.g. Jericho),
+and falls back to string() for other types.
+"""
+function format_observation_for_llm(obs)
+    if obs isa NamedTuple
+        parts = String[]
+        hasproperty(obs, :location) && push!(parts, "Location: $(obs.location)")
+        hasproperty(obs, :text) && push!(parts, "Observation: $(obs.text)")
+        hasproperty(obs, :inventory) && push!(parts, "Inventory: $(obs.inventory)")
+        hasproperty(obs, :score) && push!(parts, "Score: $(obs.score)")
+        if !isempty(parts)
+            return join(parts, "\n")
+        end
+    end
+    return string(obs)
+end
+
+"""
     query(sensor::LLMSensor, state, question::String) → Bool
 
 Query the LLM and parse the response as yes/no.
 """
 function query(sensor::LLMSensor, state, question::String)
     sensor.n_queries += 1
-    
+
     # Format prompt
     prompt = replace(sensor.prompt_template, "{question}" => question)
-    
-    # Add state context if available
+
+    # Add state context if available, formatted for LLM readability
     if !isnothing(state)
-        prompt = "Context: $state\n\n$prompt"
+        context = format_observation_for_llm(state)
+        prompt = "Context:\n$context\n\n$prompt"
     end
     
     # Query LLM
