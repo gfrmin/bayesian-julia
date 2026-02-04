@@ -318,41 +318,44 @@ function update_reliability!(sensor::LLMSensor, said_yes::Bool, actual::Bool)
 end
 
 # ============================================================================
-# RANKING QUERY (ask LLM to pick best action from a list)
+# SELECTION QUERY (ask LLM to pick best action from a list)
 # ============================================================================
 
 """
-    query_ranking(sensor::LLMSensor, observation, actions) → Union{action, Nothing}
+    query_selection(sensor::LLMSensor, context::String, actions) → Union{action, Nothing}
 
-Ask the LLM to select the most promising action from the full action list.
+Ask the LLM to select the most promising action from the full action list,
+given rich context about the current game state, recent history, and
+accumulated knowledge.
 
-One ranking query replaces N binary queries, giving more information per LLM call.
 Returns the matched action, or nothing if the response couldn't be parsed.
 """
-function query_ranking(sensor::LLMSensor, observation, actions)
+function query_selection(sensor::LLMSensor, context::String, actions)
     sensor.n_queries += 1
 
-    action_list = join(string.(actions), "\n")
-    context = format_observation_for_llm(observation)
+    action_list = join(["  $(i). $(a)" for (i, a) in enumerate(actions)], "\n")
 
-    prompt = """Context:
+    prompt = """You are advising an agent playing a text adventure game. Based on the situation below, which single action from the list is most likely to make progress toward winning?
+
 $context
 
-Which of these actions is most likely to make progress toward winning?
+Available actions:
 $action_list
 
 Reply with ONLY the action text, nothing else."""
 
-    response = lowercase(strip(sensor.llm_client.query(prompt)))
+    response = strip(sensor.llm_client.query(prompt))
+    response_lower = lowercase(response)
 
     # Match response to an action (exact match first, then substring)
     for a in actions
-        if lowercase(string(a)) == response
+        if lowercase(string(a)) == response_lower
             return a
         end
     end
     for a in actions
-        if occursin(lowercase(string(a)), response) || occursin(response, lowercase(string(a)))
+        a_lower = lowercase(string(a))
+        if occursin(a_lower, response_lower) || occursin(response_lower, a_lower)
             return a
         end
     end
@@ -361,16 +364,14 @@ Reply with ONLY the action text, nothing else."""
 end
 
 """
-    update_beliefs_from_ranking!(sensor, actions, selected, action_beliefs) → Dict
+    update_beliefs_from_selection!(sensor, actions, selected, action_beliefs) → Dict
 
-Apply Bayesian update from a ranking query result.
+Apply Bayesian update from a selection query result.
 
 The selected action gets a positive observation (posterior with answer=true).
 All non-selected actions get a negative observation (posterior with answer=false).
-Uses the existing posterior() function — same math, just applied to all actions
-from a single LLM call.
 """
-function update_beliefs_from_ranking!(sensor, actions, selected, action_beliefs::Dict)
+function update_beliefs_from_selection!(sensor, actions, selected, action_beliefs::Dict)
     for a in actions
         prior = get(action_beliefs, a, 1.0 / length(actions))
         if a == selected

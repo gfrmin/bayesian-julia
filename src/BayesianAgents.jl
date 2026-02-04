@@ -344,6 +344,9 @@ mutable struct BayesianAgent{W<:World, M<:WorldModel, P<:Planner, A<:StateAbstra
 
     # Step of last nonzero reward (for windowed credit assignment)
     last_reward_step::Int
+
+    # Observation history: (action, observation_text) for building LLM context
+    observation_history::Vector{Tuple{Any, String}}
 end
 
 """
@@ -365,7 +368,8 @@ function BayesianAgent(
         NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}[],
         Dict{Tuple{Any,Any}, Float64}(),
         Tuple{Sensor, Any, Bool, Int}[],
-        0
+        0,
+        Tuple{Any, String}[]
     )
 end
 
@@ -383,7 +387,76 @@ function reset!(agent::BayesianAgent)
     empty!(agent.trajectory)
     empty!(agent.pending_sensor_queries)
     agent.last_reward_step = 0
+    empty!(agent.observation_history)
     return agent.current_observation
+end
+
+"""
+    extract_observation_text(obs) → String
+
+Extract a text representation from an observation for storing in history.
+"""
+function extract_observation_text(obs)
+    if obs isa NamedTuple && hasproperty(obs, :text)
+        return string(obs.text)
+    else
+        return string(obs)
+    end
+end
+
+"""
+    build_llm_context(agent::BayesianAgent) → String
+
+Build rich context string for LLM selection queries. Includes:
+- Current observation (location, text, inventory, score)
+- Recent trajectory with outcomes (what happened when actions were tried)
+- World model knowledge for current state (tried actions, observed rewards)
+- Game progress (step count, score, states discovered)
+"""
+function build_llm_context(agent::BayesianAgent)
+    parts = String[]
+
+    # Current observation
+    push!(parts, format_observation_for_llm(agent.current_observation))
+
+    # Recent history with outcomes
+    if !isempty(agent.observation_history)
+        push!(parts, "")
+        push!(parts, "Recent history:")
+        n = min(15, length(agent.observation_history))
+        for (action, outcome) in agent.observation_history[end-n+1:end]
+            short = length(outcome) > 120 ? outcome[1:120] * "..." : outcome
+            # Collapse whitespace for readability
+            short = replace(short, r"\s+" => " ")
+            push!(parts, "  > $action → $short")
+        end
+    end
+
+    # World model knowledge: what actions have been tried from this state
+    s = agent.current_abstract_state
+    tried = String[]
+    for (key, p) in agent.model.reward_posterior
+        if key[1] == s
+            n_obs = Int(p.κ - agent.model.reward_prior.κ)
+            if n_obs > 0
+                avg_r = round(p.μ, digits=2)
+                push!(tried, "'$(key[2])' (tried $(n_obs)×, avg reward $avg_r)")
+            end
+        end
+    end
+    if !isempty(tried)
+        push!(parts, "")
+        push!(parts, "Previously tried from this location:")
+        for t in tried
+            push!(parts, "  $t")
+        end
+    end
+
+    # Game progress
+    push!(parts, "")
+    push!(parts, "Step $(agent.step_count), total reward $(agent.total_reward), $(length(agent.model.known_states)) states discovered")
+
+    return join(parts, "\n")
 end
 
 """
@@ -417,42 +490,57 @@ function act!(agent::BayesianAgent)
         mean_reward + belief
     end
 
-    # Build action history from recent trajectory for LLM context
-    action_history = [t.a for t in agent.trajectory[max(1,end-9):end]]
-
     for sensor in agent.sensors
-        queries_made = 0
-
-        # Binary VOI-gated queries only — no ranking queries
-        while queries_made < agent.config.max_queries_per_step
-            best_voi = 0.0
-            best_action_to_ask = nothing
-
+        if sensor isa LLMSensor
+            # LLM sensor: single selection query ("which action is best?")
+            # VOI check: use max single-action VOI as proxy for selection query value
+            max_voi = 0.0
             for a in available_actions
                 prior = action_beliefs[a]
                 (prior < 0.01 || prior > 0.99) && continue
-
                 voi = compute_voi(sensor, prior, available_actions,
                     (act, belief) -> eu_func(act, act == a ? belief : action_beliefs[act]))
-
-                if voi > best_voi
-                    best_voi = voi
-                    best_action_to_ask = a
-                end
+                max_voi = max(max_voi, voi)
             end
 
-            (best_voi <= agent.config.sensor_cost || isnothing(best_action_to_ask)) && break
+            if max_voi > agent.config.sensor_cost
+                context = build_llm_context(agent)
+                selected = query_selection(sensor, context, available_actions)
 
-            question = "Will action \"$(best_action_to_ask)\" help make progress?"
-            answer = query(sensor, agent.current_observation, question;
-                           action_history=action_history)
+                if !isnothing(selected)
+                    update_beliefs_from_selection!(sensor, available_actions, selected, action_beliefs)
+                    push!(sensor_queries, (sensor, selected, true))
+                    @debug "LLM selection" sensor=sensor.name selected voi=max_voi
+                end
+            end
+        else
+            # Binary sensors (oracle, heuristic): VOI-gated yes/no queries
+            queries_made = 0
+            while queries_made < agent.config.max_queries_per_step
+                best_voi = 0.0
+                best_action_to_ask = nothing
 
-            action_beliefs[best_action_to_ask] = posterior(
-                sensor, action_beliefs[best_action_to_ask], answer)
+                for a in available_actions
+                    prior = action_beliefs[a]
+                    (prior < 0.01 || prior > 0.99) && continue
+                    voi = compute_voi(sensor, prior, available_actions,
+                        (act, belief) -> eu_func(act, act == a ? belief : action_beliefs[act]))
+                    if voi > best_voi
+                        best_voi = voi
+                        best_action_to_ask = a
+                    end
+                end
 
-            push!(sensor_queries, (sensor, best_action_to_ask, answer))
-            queries_made += 1
-            @debug "sensor query" sensor=sensor.name action=best_action_to_ask answer voi=best_voi belief=action_beliefs[best_action_to_ask]
+                (best_voi <= agent.config.sensor_cost || isnothing(best_action_to_ask)) && break
+
+                question = "Will action \"$(best_action_to_ask)\" help make progress?"
+                answer = query(sensor, agent.current_observation, question)
+                action_beliefs[best_action_to_ask] = posterior(
+                    sensor, action_beliefs[best_action_to_ask], answer)
+                push!(sensor_queries, (sensor, best_action_to_ask, answer))
+                queries_made += 1
+                @debug "binary query" sensor=sensor.name action=best_action_to_ask answer voi=best_voi belief=action_beliefs[best_action_to_ask]
+            end
         end
     end
 
@@ -472,22 +560,24 @@ function act!(agent::BayesianAgent)
     action = plan_with_priors(agent.planner, s, agent.model, available_actions, action_priors)
     @debug "action selected" action beliefs=action_beliefs n_sensor_queries=length(sensor_queries)
 
-    # Post-planning query: if the chosen action wasn't already queried, ask about it
-    # so we get a sensor prediction to compare against ground truth
-    already_queried = any(qa -> qa[2] == action, sensor_queries)
-    if !already_queried && !isempty(agent.sensors)
-        sensor = first(agent.sensors)
-        question = "Will action \"$(action)\" help make progress?"
-        answer = query(sensor, agent.current_observation, question;
-                       action_history=action_history)
-        push!(sensor_queries, (sensor, action, answer))
-        @debug "post-planning query" sensor=sensor.name action answer
+    # If the planner picks a different action than the LLM selected, store a
+    # negative prediction for the executed action — the LLM implicitly said
+    # "this is NOT the best action". This gives us learning signal even when
+    # the planner overrides the LLM.
+    llm_selected = isempty(sensor_queries) ? nothing : sensor_queries[end][2]
+    if !isnothing(llm_selected) && action != llm_selected
+        llm_sensor = sensor_queries[end][1]
+        push!(sensor_queries, (llm_sensor, action, false))
+        @debug "implicit negative" sensor=llm_sensor.name selected=llm_selected executed=action
     end
 
     # Execute action
     obs, reward, done, info = step!(agent.world, action)
     s′ = abstract_state(agent.abstractor, obs)
     @debug "step result" action reward new_state=s′ done
+
+    # Store observation text for LLM context history
+    push!(agent.observation_history, (action, extract_observation_text(obs)))
 
     # Update model
     update!(agent.model, s, action, reward, s′)
@@ -631,7 +721,8 @@ export GridWorld, spawn_food!
 export TabularWorldModel, NormalGammaPosterior, SampledDynamics, sample_dynamics, sample_next_state, get_reward, information_gain
 export ThompsonMCTS, MCTSNode, plan_with_priors, select_rollout_action
 export IdentityAbstractor, BisimulationAbstractor, abstraction_summary
-export BinarySensor, LLMSensor, format_observation_for_llm, query_ranking, update_beliefs_from_ranking!, is_null_outcome
+export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome
+export extract_observation_text, build_llm_context
 export action_features, collect_posteriors, combine_posteriors
 
 end # module
