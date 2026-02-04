@@ -324,7 +324,15 @@ end
 """
     rollout(planner, node, dynamics, actions, depth) → value
 
-Random rollout from a node to estimate value.
+Informed rollout from a node to estimate value.
+
+Uses a greedy policy over known rewards in the sampled dynamics: if any action
+from the current rollout state has a positive sampled reward, take the best one.
+Otherwise fall back to a random action.
+
+This is standard MCTS practice — the rollout policy is a heuristic that doesn't
+affect the tree policy's theoretical properties. It just makes rollout value
+estimates less noisy by exploiting the model's knowledge of rewarding transitions.
 """
 function rollout(
     planner::ThompsonMCTS,
@@ -336,24 +344,52 @@ function rollout(
     if depth == 0 || node.is_terminal
         return 0.0
     end
-    
+
     state = node.state
     total_value = 0.0
     discount = 1.0
-    
+
     for _ in 1:depth
-        # Random action
-        action = rand(actions)
-        
-        # Get reward and next state
+        action = select_rollout_action(dynamics, state, actions)
+
         reward = get_reward(dynamics, state, action)
         state = sample_next_state(dynamics, state, action)
-        
+
         total_value += discount * reward
         discount *= planner.discount
     end
-    
+
     return total_value
+end
+
+"""
+    select_rollout_action(dynamics, state, actions) → action
+
+Select an action for rollout using a greedy policy over sampled rewards.
+
+Only goes greedy if there's a positive-reward action from this state in the
+sampled dynamics. The reward is keyed by (state, action), so this respects
+the transition structure — no chasing rewards from other states.
+"""
+function select_rollout_action(dynamics, state, actions)
+    best_r = -Inf
+    best_a = nothing
+
+    for a in actions
+        key = (state, a)
+        if haskey(dynamics.rewards, key)
+            r = dynamics.rewards[key]
+            if r > best_r
+                best_r = r
+                best_a = a
+            end
+        end
+    end
+
+    if !isnothing(best_a) && best_r > 0
+        return best_a
+    end
+    return rand(actions)
 end
 
 """

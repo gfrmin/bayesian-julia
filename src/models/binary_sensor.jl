@@ -56,11 +56,11 @@ function BinarySensor(
 end
 
 """
-    query(sensor::BinarySensor, state, question) → Bool
+    query(sensor::BinarySensor, state, question; action_history=nothing) → Bool
 
 Query the sensor and return its answer.
 """
-function query(sensor::BinarySensor, state, question)
+function query(sensor::BinarySensor, state, question; action_history=nothing)
     sensor.n_queries += 1
     return sensor.query_fn(state, question)
 end
@@ -249,11 +249,14 @@ function format_observation_for_llm(obs)
 end
 
 """
-    query(sensor::LLMSensor, state, question::String) → Bool
+    query(sensor::LLMSensor, state, question::String; action_history=nothing) → Bool
 
 Query the LLM and parse the response as yes/no.
+
+When `action_history` is provided (a vector of recent action strings), it is
+included in the prompt so the LLM can avoid recommending already-tried actions.
 """
-function query(sensor::LLMSensor, state, question::String)
+function query(sensor::LLMSensor, state, question::String; action_history=nothing)
     sensor.n_queries += 1
 
     # Format prompt
@@ -264,10 +267,16 @@ function query(sensor::LLMSensor, state, question::String)
         context = format_observation_for_llm(state)
         prompt = "Context:\n$context\n\n$prompt"
     end
-    
+
+    # Add action history if available
+    if !isnothing(action_history) && !isempty(action_history)
+        history_str = join(string.(action_history), ", ")
+        prompt = "$prompt\n\nRecent actions tried: $history_str"
+    end
+
     # Query LLM
     response = lowercase(strip(sensor.llm_client.query(prompt)))
-    
+
     # Parse response
     if startswith(response, "yes")
         return true
@@ -306,4 +315,96 @@ function update_reliability!(sensor::LLMSensor, said_yes::Bool, actual::Bool)
             sensor.n_correct += 1
         end
     end
+end
+
+# ============================================================================
+# RANKING QUERY (ask LLM to pick best action from a list)
+# ============================================================================
+
+"""
+    query_ranking(sensor::LLMSensor, observation, actions) → Union{action, Nothing}
+
+Ask the LLM to select the most promising action from the full action list.
+
+One ranking query replaces N binary queries, giving more information per LLM call.
+Returns the matched action, or nothing if the response couldn't be parsed.
+"""
+function query_ranking(sensor::LLMSensor, observation, actions)
+    sensor.n_queries += 1
+
+    action_list = join(string.(actions), "\n")
+    context = format_observation_for_llm(observation)
+
+    prompt = """Context:
+$context
+
+Which of these actions is most likely to make progress toward winning?
+$action_list
+
+Reply with ONLY the action text, nothing else."""
+
+    response = lowercase(strip(sensor.llm_client.query(prompt)))
+
+    # Match response to an action (exact match first, then substring)
+    for a in actions
+        if lowercase(string(a)) == response
+            return a
+        end
+    end
+    for a in actions
+        if occursin(lowercase(string(a)), response) || occursin(response, lowercase(string(a)))
+            return a
+        end
+    end
+
+    return nothing
+end
+
+"""
+    update_beliefs_from_ranking!(sensor, actions, selected, action_beliefs) → Dict
+
+Apply Bayesian update from a ranking query result.
+
+The selected action gets a positive observation (posterior with answer=true).
+All non-selected actions get a negative observation (posterior with answer=false).
+Uses the existing posterior() function — same math, just applied to all actions
+from a single LLM call.
+"""
+function update_beliefs_from_ranking!(sensor, actions, selected, action_beliefs::Dict)
+    for a in actions
+        prior = get(action_beliefs, a, 1.0 / length(actions))
+        if a == selected
+            action_beliefs[a] = posterior(sensor, prior, true)
+        else
+            action_beliefs[a] = posterior(sensor, prior, false)
+        end
+    end
+    return action_beliefs
+end
+
+# ============================================================================
+# NULL OUTCOME DETECTION
+# ============================================================================
+
+"""
+    is_null_outcome(obs_before, obs_after) → Bool
+
+Detect whether an action produced no change — same command + same observation
+text means the transition is S→S with reward 0.
+
+This is a world model fact: P(obs_unchanged | action_helpful) ≈ 0. Used to
+provide negative ground truth to sensors without waiting for sparse rewards.
+"""
+function is_null_outcome(obs_before, obs_after)
+    text_before = if obs_before isa NamedTuple && hasproperty(obs_before, :text)
+        obs_before.text
+    else
+        string(obs_before)
+    end
+    text_after = if obs_after isa NamedTuple && hasproperty(obs_after, :text)
+        obs_after.text
+    else
+        string(obs_after)
+    end
+    return strip(text_before) == strip(text_after)
 end

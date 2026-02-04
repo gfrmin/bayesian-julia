@@ -338,6 +338,12 @@ mutable struct BayesianAgent{W<:World, M<:WorldModel, P<:Planner, A<:StateAbstra
     # Persistent action beliefs: (abstract_state, action) → P(action helps)
     # Survives across steps and episodes so sensor learning is not lost
     action_belief_cache::Dict{Tuple{Any,Any}, Float64}
+
+    # Pending sensor queries awaiting ground truth: (sensor, action, said_yes, step)
+    pending_sensor_queries::Vector{Tuple{Sensor, Any, Bool, Int}}
+
+    # Step of last nonzero reward (for windowed credit assignment)
+    last_reward_step::Int
 end
 
 """
@@ -357,7 +363,9 @@ function BayesianAgent(
         world, model, planner, abstractor, convert(Vector{Sensor}, sensors), config,
         nothing, nothing, 0, 0, 0.0,
         NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}[],
-        Dict{Tuple{Any,Any}, Float64}()
+        Dict{Tuple{Any,Any}, Float64}(),
+        Tuple{Sensor, Any, Bool, Int}[],
+        0
     )
 end
 
@@ -373,6 +381,8 @@ function reset!(agent::BayesianAgent)
     agent.episode_count += 1
     agent.total_reward = 0.0
     empty!(agent.trajectory)
+    empty!(agent.pending_sensor_queries)
+    agent.last_reward_step = 0
     return agent.current_observation
 end
 
@@ -407,8 +417,13 @@ function act!(agent::BayesianAgent)
         mean_reward + belief
     end
 
+    # Build action history from recent trajectory for LLM context
+    action_history = [t.a for t in agent.trajectory[max(1,end-9):end]]
+
     for sensor in agent.sensors
         queries_made = 0
+
+        # Binary VOI-gated queries only — no ranking queries
         while queries_made < agent.config.max_queries_per_step
             best_voi = 0.0
             best_action_to_ask = nothing
@@ -429,7 +444,8 @@ function act!(agent::BayesianAgent)
             (best_voi <= agent.config.sensor_cost || isnothing(best_action_to_ask)) && break
 
             question = "Will action \"$(best_action_to_ask)\" help make progress?"
-            answer = query(sensor, agent.current_observation, question)
+            answer = query(sensor, agent.current_observation, question;
+                           action_history=action_history)
 
             action_beliefs[best_action_to_ask] = posterior(
                 sensor, action_beliefs[best_action_to_ask], answer)
@@ -462,7 +478,8 @@ function act!(agent::BayesianAgent)
     if !already_queried && !isempty(agent.sensors)
         sensor = first(agent.sensors)
         question = "Will action \"$(action)\" help make progress?"
-        answer = query(sensor, agent.current_observation, question)
+        answer = query(sensor, agent.current_observation, question;
+                       action_history=action_history)
         push!(sensor_queries, (sensor, action, answer))
         @debug "post-planning query" sensor=sensor.name action answer
     end
@@ -484,12 +501,20 @@ function act!(agent::BayesianAgent)
         refine!(agent.abstractor, contradiction)
     end
     
-    # Update sensor reliability from ground truth (reward > 0 means action helped)
-    actually_helped = reward > 0
+    # Store sensor queries for delayed credit assignment
     for (sensor, queried_action, said_yes) in sensor_queries
-        if queried_action == action
-            update_reliability!(sensor, said_yes, actually_helped)
-        end
+        push!(agent.pending_sensor_queries, (sensor, queried_action, said_yes, agent.step_count))
+    end
+
+    # Null-action ground truth: if observation text unchanged, action was unhelpful
+    if is_null_outcome(agent.current_observation, obs)
+        resolve_null_action_queries!(agent, action)
+    end
+
+    # When reward != 0, resolve pending queries with discounted trajectory credit
+    if reward != 0.0
+        resolve_pending_queries!(agent, reward)
+        agent.last_reward_step = agent.step_count
     end
 
     # Record transition
@@ -502,6 +527,57 @@ function act!(agent::BayesianAgent)
     agent.total_reward += reward
 
     return action, obs, reward, done
+end
+
+"""
+    resolve_pending_queries!(agent::BayesianAgent, reward::Float64)
+
+Resolve pending sensor queries using discounted trajectory credit.
+
+Actions close to the reward event get strong credit (γ^1), distant actions get
+weak credit (γ^20). The proposition was "action helps make progress" — temporal
+proximity determines how much credit the action receives. Very distant actions
+(|discounted| < 0.001) are skipped entirely to avoid noise.
+"""
+function resolve_pending_queries!(agent::BayesianAgent, reward::Float64)
+    γ = agent.config.discount
+    resolved = Int[]
+    for (i, (sensor, action, said_yes, step)) in enumerate(agent.pending_sensor_queries)
+        if step > agent.last_reward_step
+            steps_elapsed = agent.step_count - step
+            discounted = reward * γ^steps_elapsed
+            # Skip if credit is negligible (avoids noise from very distant actions)
+            if abs(discounted) < 0.001
+                continue
+            end
+            actually_helped = discounted > 0.0
+            update_reliability!(sensor, said_yes, actually_helped)
+            push!(resolved, i)
+            @debug "trajectory credit" action said_yes actually_helped discount=γ^steps_elapsed
+        end
+    end
+    deleteat!(agent.pending_sensor_queries, sort(resolved))
+end
+
+"""
+    resolve_null_action_queries!(agent::BayesianAgent, null_action)
+
+Resolve pending sensor queries about an action that produced no change.
+
+When observation text is identical before and after, the action was definitively
+unhelpful: P(obs_unchanged | action_helpful) ≈ 0. This provides negative ground
+truth to calibrate the sensor's FPR without waiting for sparse rewards.
+"""
+function resolve_null_action_queries!(agent::BayesianAgent, null_action)
+    resolved = Int[]
+    for (i, (sensor, queried_action, said_yes, step)) in enumerate(agent.pending_sensor_queries)
+        if queried_action == null_action
+            update_reliability!(sensor, said_yes, false)
+            push!(resolved, i)
+            @debug "null action ground truth" action=null_action said_yes
+        end
+    end
+    deleteat!(agent.pending_sensor_queries, sort(resolved))
 end
 
 """
@@ -531,7 +607,7 @@ export sample_dynamics, update!, transition_dist, reward_dist, entropy
 export abstract_state, record_transition!, check_contradiction, refine!
 export plan
 export compute_voi
-export AgentConfig, BayesianAgent, act!, run_episode!
+export AgentConfig, BayesianAgent, act!, run_episode!, resolve_pending_queries!, resolve_null_action_queries!
 
 # Include implementations
 include("models/tabular_world_model.jl")
@@ -552,9 +628,10 @@ end
 
 # Additional exports
 export GridWorld, spawn_food!
-export TabularWorldModel, sample_dynamics, information_gain
-export ThompsonMCTS, MCTSNode, plan_with_priors
-export IdentityAbstractor, BisimulationAbstractor
-export BinarySensor, LLMSensor, format_observation_for_llm
+export TabularWorldModel, NormalGammaPosterior, SampledDynamics, sample_dynamics, sample_next_state, get_reward, information_gain
+export ThompsonMCTS, MCTSNode, plan_with_priors, select_rollout_action
+export IdentityAbstractor, BisimulationAbstractor, abstraction_summary
+export BinarySensor, LLMSensor, format_observation_for_llm, query_ranking, update_beliefs_from_ranking!, is_null_outcome
+export action_features, collect_posteriors, combine_posteriors
 
 end # module

@@ -36,32 +36,42 @@ Learns state equivalence classes based on observed behaviour.
 mutable struct BisimulationAbstractor <: StateAbstractor
     # Mapping from concrete observation to abstract state ID
     observation_to_abstract::Dict{Any, Int}
-    
+
     # Mapping from abstract state ID to set of concrete observations
     abstract_to_observations::Dict{Int, Set{Any}}
-    
+
     # Behavioural signatures for each concrete observation
     signatures::Dict{Any, BehaviouralSignature}
-    
+
     # Counter for abstract state IDs
     next_abstract_id::Int
-    
+
     # Pending transitions (for delayed signature updates)
     pending_transitions::Vector{NamedTuple{(:s, :a, :r, :s_obs), Tuple{Any, Any, Float64, Any}}}
-    
+
     # Detected contradictions
     contradictions::Vector{NamedTuple{(:abstract_state, :observations, :differing_outcomes), Tuple{Int, Vector{Any}, Any}}}
-    
+
     # Threshold for considering signatures different
     similarity_threshold::Float64
+
+    # Threshold for considering reward differences significant
+    reward_threshold::Float64
+
+    # Preprocessing function applied to observations before abstraction
+    preprocess_fn::Function
 end
 
 """
-    BisimulationAbstractor(; similarity_threshold=0.95)
+    BisimulationAbstractor(; similarity_threshold=0.95, reward_threshold=0.1, preprocess_fn=identity)
 
 Create a new bisimulation abstractor.
 """
-function BisimulationAbstractor(; similarity_threshold::Float64 = 0.95)
+function BisimulationAbstractor(;
+    similarity_threshold::Float64 = 0.95,
+    reward_threshold::Float64 = 0.1,
+    preprocess_fn::Function = identity
+)
     return BisimulationAbstractor(
         Dict{Any, Int}(),
         Dict{Int, Set{Any}}(),
@@ -69,7 +79,9 @@ function BisimulationAbstractor(; similarity_threshold::Float64 = 0.95)
         1,
         [],
         [],
-        similarity_threshold
+        similarity_threshold,
+        reward_threshold,
+        preprocess_fn
     )
 end
 
@@ -80,36 +92,40 @@ Map an observation to its abstract state ID.
 Creates a new abstract state if this observation hasn't been seen before.
 """
 function abstract_state(abstractor::BisimulationAbstractor, observation)
-    if haskey(abstractor.observation_to_abstract, observation)
-        return abstractor.observation_to_abstract[observation]
+    # Preprocess the observation to strip irrelevant fields
+    obs = abstractor.preprocess_fn(observation)
+
+    if haskey(abstractor.observation_to_abstract, obs)
+        return abstractor.observation_to_abstract[obs]
     end
-    
+
     # New observation — first check if it matches any existing signature
-    if haskey(abstractor.signatures, observation)
-        sig = abstractor.signatures[observation]
-        
+    if haskey(abstractor.signatures, obs)
+        sig = abstractor.signatures[obs]
+
         # Find matching abstract state
         for (abstract_id, obs_set) in abstractor.abstract_to_observations
             for existing_obs in obs_set
                 if haskey(abstractor.signatures, existing_obs)
-                    if signatures_match(sig, abstractor.signatures[existing_obs], abstractor.similarity_threshold)
+                    if signatures_match(sig, abstractor.signatures[existing_obs],
+                                        abstractor.similarity_threshold, abstractor.reward_threshold)
                         # Match found — add to this equivalence class
-                        abstractor.observation_to_abstract[observation] = abstract_id
-                        push!(obs_set, observation)
+                        abstractor.observation_to_abstract[obs] = abstract_id
+                        push!(obs_set, obs)
                         return abstract_id
                     end
                 end
             end
         end
     end
-    
+
     # No match — create new abstract state
     abstract_id = abstractor.next_abstract_id
     abstractor.next_abstract_id += 1
-    
-    abstractor.observation_to_abstract[observation] = abstract_id
-    abstractor.abstract_to_observations[abstract_id] = Set([observation])
-    
+
+    abstractor.observation_to_abstract[obs] = abstract_id
+    abstractor.abstract_to_observations[abstract_id] = Set([obs])
+
     return abstract_id
 end
 
@@ -122,29 +138,35 @@ function record_transition!(abstractor::BisimulationAbstractor, s, a, r, s′)
     # Get the concrete observation for the source state
     # (s might be an abstract state ID, so we need to handle both cases)
     s_obs = get_observation_for_abstract(abstractor, s)
-    
+
     if isnothing(s_obs)
         # s is already a concrete observation
         s_obs = s
     end
-    
+
     # Record the transition
     push!(abstractor.pending_transitions, (s=s, a=a, r=r, s_obs=s_obs))
-    
+
     # Update signature
     if !haskey(abstractor.signatures, s_obs)
         abstractor.signatures[s_obs] = BehaviouralSignature()
     end
-    
+
     sig = abstractor.signatures[s_obs]
     if !haskey(sig, a)
         sig[a] = ActionOutcome[]
     end
-    
-    # Get abstract state of s′
-    s′_abstract = abstract_state(abstractor, s′)
+
+    # Get abstract state of s′ — if s′ is already an abstract state ID
+    # (exists in abstract_to_observations), use it directly to avoid
+    # creating a spurious abstract state for the integer itself
+    s′_abstract = if haskey(abstractor.abstract_to_observations, s′)
+        s′
+    else
+        abstract_state(abstractor, s′)
+    end
     push!(sig[a], ActionOutcome(r, s′_abstract))
-    
+
     return nothing
 end
 
@@ -185,8 +207,8 @@ function check_contradiction(abstractor::BisimulationAbstractor)
                     sig1, sig2 = abstractor.signatures[obs1], abstractor.signatures[obs2]
                     
                     # Check for conflicting outcomes on shared actions
-                    conflict = find_conflict(sig1, sig2)
-                    
+                    conflict = find_conflict(sig1, sig2, abstractor.reward_threshold)
+
                     if !isnothing(conflict)
                         contradiction = (
                             abstract_state = abstract_id,
@@ -204,39 +226,39 @@ function check_contradiction(abstractor::BisimulationAbstractor)
 end
 
 """
-    find_conflict(sig1, sig2) → conflict or nothing
+    find_conflict(sig1, sig2, reward_threshold) → conflict or nothing
 
 Find conflicting outcomes between two signatures.
 """
-function find_conflict(sig1::BehaviouralSignature, sig2::BehaviouralSignature)
+function find_conflict(sig1::BehaviouralSignature, sig2::BehaviouralSignature, reward_threshold::Float64)
     for (action, outcomes1) in sig1
         if haskey(sig2, action)
             outcomes2 = sig2[action]
-            
+
             # Compare reward distributions
             rewards1 = [o.reward for o in outcomes1]
             rewards2 = [o.reward for o in outcomes2]
-            
+
             if !isempty(rewards1) && !isempty(rewards2)
-                mean1, mean2 = mean(rewards1), mean(rewards2)
-                
+                mean1, mean2 = _sig_mean(rewards1), _sig_mean(rewards2)
+
                 # Significant reward difference?
-                if abs(mean1 - mean2) > 0.1
+                if abs(mean1 - mean2) > reward_threshold
                     return (action=action, type=:reward, values=(mean1, mean2))
                 end
             end
-            
+
             # Compare transition distributions
             nexts1 = Set(o.next_abstract_state for o in outcomes1)
             nexts2 = Set(o.next_abstract_state for o in outcomes2)
-            
+
             # Do they lead to different abstract states?
             if !isempty(setdiff(nexts1, nexts2)) || !isempty(setdiff(nexts2, nexts1))
                 return (action=action, type=:transition, values=(nexts1, nexts2))
             end
         end
     end
-    
+
     return nothing
 end
 
@@ -302,7 +324,7 @@ function reclassify_observations!(abstractor::BisimulationAbstractor, old_id::In
             obs_sig = abstractor.signatures[obs]
             
             # Does this observation's signature match the new class better?
-            if signatures_match(obs_sig, new_sig, abstractor.similarity_threshold)
+            if signatures_match(obs_sig, new_sig, abstractor.similarity_threshold, abstractor.reward_threshold)
                 push!(to_move, obs)
             end
         end
@@ -317,58 +339,59 @@ function reclassify_observations!(abstractor::BisimulationAbstractor, old_id::In
 end
 
 """
-    signatures_match(sig1, sig2, threshold) → Bool
+    signatures_match(sig1, sig2, threshold, reward_threshold) → Bool
 
 Check if two behavioural signatures are similar enough to be considered equivalent.
 """
-function signatures_match(sig1::BehaviouralSignature, sig2::BehaviouralSignature, threshold::Float64)
+function signatures_match(sig1::BehaviouralSignature, sig2::BehaviouralSignature,
+                          threshold::Float64, reward_threshold::Float64)
     # Check shared actions
     shared_actions = intersect(keys(sig1), keys(sig2))
-    
+
     if isempty(shared_actions)
         # No shared actions — can't determine similarity
         return false
     end
-    
+
     matches = 0
     total = 0
-    
+
     for action in shared_actions
         outcomes1 = sig1[action]
         outcomes2 = sig2[action]
-        
+
         if isempty(outcomes1) || isempty(outcomes2)
             continue
         end
-        
+
         # Compare rewards
-        r1 = mean(o.reward for o in outcomes1)
-        r2 = mean(o.reward for o in outcomes2)
-        
-        if abs(r1 - r2) < 0.1
+        r1 = _sig_mean(o.reward for o in outcomes1)
+        r2 = _sig_mean(o.reward for o in outcomes2)
+
+        if abs(r1 - r2) < reward_threshold
             matches += 1
         end
         total += 1
-        
+
         # Compare transitions
         nexts1 = Set(o.next_abstract_state for o in outcomes1)
         nexts2 = Set(o.next_abstract_state for o in outcomes2)
-        
+
         if nexts1 == nexts2
             matches += 1
         end
         total += 1
     end
-    
+
     return total > 0 && (matches / total) >= threshold
 end
 
 """
-    mean(itr)
+    _sig_mean(itr)
 
-Compute the mean of an iterable.
+Compute the mean of an iterable. Named to avoid shadowing Base/Statistics mean.
 """
-function mean(itr)
+function _sig_mean(itr)
     vals = collect(itr)
     return isempty(vals) ? 0.0 : sum(vals) / length(vals)
 end

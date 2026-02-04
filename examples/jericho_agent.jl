@@ -57,6 +57,22 @@ BayesianAgents.check_contradiction(::JerichoStateAbstractor) = nothing
 BayesianAgents.refine!(::JerichoStateAbstractor, contradiction) = nothing
 
 # ============================================================================
+# JERICHO FEATURE EXTRACTOR (for factored reward model)
+# ============================================================================
+
+"""
+Extract feature keys from a Jericho abstract state (e.g. "Kitchen|a3f2b1c8").
+
+Returns features like [(:location, "Kitchen")] so the factored reward model
+can generalise across states sharing the same location.
+"""
+function jericho_features(abstract_state)
+    parts = split(string(abstract_state), "|")
+    features = Any[(:location, parts[1])]
+    return features
+end
+
+# ============================================================================
 # OLLAMA CLIENT (pure Julia, stdlib Downloads + JSON.jl)
 # ============================================================================
 
@@ -111,8 +127,8 @@ function run_jericho_experiment(;
     max_steps::Int = 50,
     use_llm::Bool = false,
     ollama_model::String = "llama3.2",
-    mcts_iterations::Int = 30,
-    mcts_depth::Int = 3,
+    mcts_iterations::Int = 60,
+    mcts_depth::Int = 8,
     verbose::Bool = true
 )
     println("=" ^ 60)
@@ -130,11 +146,12 @@ function run_jericho_experiment(;
     println("Max score: $(world.max_score)")
     println()
 
-    # Create world model
+    # Create world model with feature extractor for generalisation
     model = TabularWorldModel(
         transition_prior = 0.1,
         reward_prior_mean = 0.0,
-        reward_prior_variance = 1.0
+        reward_prior_variance = 1.0,
+        feature_extractor = jericho_features
     )
 
     # Create planner
@@ -159,10 +176,13 @@ function run_jericho_experiment(;
             @warn "Ollama not responding — continuing without LLM sensor"
         else
             println("Ollama connected: $(strip(test_response))")
+            # Skeptical prior: uniform Beta(1,1) for both TPR and FPR.
+            # With TPR=0.5, FPR=0.5, posterior updates barely move beliefs —
+            # the LLM has near-zero influence until ground truth calibrates it.
             sensor = LLMSensor("llm", client;
                 prompt_template = "{question}",
-                tp_prior = (2.0, 1.0),
-                fp_prior = (1.0, 2.0))
+                tp_prior = (1.0, 1.0),
+                fp_prior = (1.0, 1.0))
             push!(sensors, sensor)
         end
         println()
@@ -264,8 +284,8 @@ function parse_args(args)
     use_llm = false
     ollama_model = "llama3.2"
     verbose = true
-    mcts_iterations = 30
-    mcts_depth = 3
+    mcts_iterations = 60
+    mcts_depth = 8
 
     i = 1
     while i <= length(args)

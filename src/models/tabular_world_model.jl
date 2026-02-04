@@ -3,7 +3,7 @@
 
 A Bayesian world model for discrete state-action spaces using:
 - Dirichlet-Categorical for transition probabilities
-- Normal-Gamma for reward distributions
+- Normal-Gamma conjugate prior for reward distributions
 
 Supports Thompson Sampling via sampling from posteriors.
 """
@@ -11,80 +11,168 @@ Supports Thompson Sampling via sampling from posteriors.
 using Distributions
 
 """
+    NormalGammaPosterior
+
+Conjugate prior for Normal observations with unknown mean and variance.
+
+    μ | σ² ~ Normal(μ₀, σ²/κ)
+    σ²     ~ InvGamma(α, β)
+
+Posterior predictive is a t-distribution:
+    r ~ t_{2α}(μ, β(κ+1)/(ακ))
+"""
+struct NormalGammaPosterior
+    κ::Float64   # pseudo-observations for mean (controls mean certainty)
+    μ::Float64   # posterior mean location
+    α::Float64   # shape: half-observations for variance
+    β::Float64   # rate: scaled sum of squared deviations
+end
+
+"""
     TabularWorldModel
 
 Maintains Bayesian beliefs over transition and reward dynamics.
+
+Optionally maintains feature-level reward posteriors alongside the tabular model.
+When a `feature_extractor` is provided, reward predictions combine tabular and
+feature posteriors via precision-weighted averaging — features with more observations
+(higher κ) contribute more. This enables generalisation: seeing reward for "eat" in
+Kitchen informs "eat" in Pantry via shared (:action_type, :interact) features.
 """
 mutable struct TabularWorldModel <: WorldModel
     # Transition model: (state, action) → Dirichlet over next states
     # Stored as counts: transition_counts[(s,a)][s'] = count
     transition_counts::Dict{Tuple{Any,Any}, Dict{Any, Float64}}
-    
+
     # Reward model: (state, action) → Normal-Gamma posterior
-    # Stored as sufficient statistics
-    reward_stats::Dict{Tuple{Any,Any}, NamedTuple{(:n, :mean, :sum_sq), Tuple{Int, Float64, Float64}}}
-    
+    reward_posterior::Dict{Tuple{Any,Any}, NormalGammaPosterior}
+
+    # Feature-level reward posteriors: (feature_key, action) → NormalGammaPosterior
+    # Enables generalisation across states sharing features (location, action type, etc.)
+    feature_reward_posterior::Dict{Tuple{Any,Any}, NormalGammaPosterior}
+
+    # Feature extractor: abstract_state → Vector of feature keys
+    # nothing means pure tabular (existing behaviour)
+    feature_extractor::Union{Nothing, Function}
+
     # Prior hyperparameters
     transition_prior::Float64  # Dirichlet concentration (pseudocount per state)
-    reward_prior_mean::Float64
-    reward_prior_variance::Float64
-    
+    reward_prior::NormalGammaPosterior  # Prior for unseen (s,a) pairs
+
     # Known states (discovered during interaction)
     known_states::Set{Any}
 end
 
 """
-    TabularWorldModel(; transition_prior=0.1, reward_prior_mean=0.0, reward_prior_variance=1.0)
+    TabularWorldModel(; transition_prior=0.1, reward_prior_mean=0.0, reward_prior_variance=1.0, feature_extractor=nothing)
 
 Create a new tabular world model with specified priors.
+
+The reward prior is a Normal-Gamma with:
+- κ₀ = 1.0 (one pseudo-observation worth of mean certainty)
+- μ₀ = reward_prior_mean
+- α₀ = 1.0 (weakly informative variance prior)
+- β₀ = reward_prior_variance (prior scale for variance)
+
+When `feature_extractor` is provided (a function: abstract_state → Vector of feature keys),
+the model also maintains feature-level reward posteriors and combines them with tabular
+posteriors via precision-weighted averaging in reward_dist and sample_dynamics.
 """
 function TabularWorldModel(;
     transition_prior::Float64 = 0.1,
     reward_prior_mean::Float64 = 0.0,
-    reward_prior_variance::Float64 = 1.0
+    reward_prior_variance::Float64 = 1.0,
+    feature_extractor::Union{Nothing, Function} = nothing
 )
+    prior = NormalGammaPosterior(1.0, reward_prior_mean, 1.0, reward_prior_variance)
     return TabularWorldModel(
         Dict{Tuple{Any,Any}, Dict{Any, Float64}}(),
-        Dict{Tuple{Any,Any}, NamedTuple{(:n, :mean, :sum_sq), Tuple{Int, Float64, Float64}}}(),
+        Dict{Tuple{Any,Any}, NormalGammaPosterior}(),
+        Dict{Tuple{Any,Any}, NormalGammaPosterior}(),
+        feature_extractor,
         transition_prior,
-        reward_prior_mean,
-        reward_prior_variance,
+        prior,
         Set{Any}()
     )
+end
+
+"""
+    action_features(action) → Vector
+
+Extract feature keys from an action string for the factored reward model.
+Returns a vector of (feature_type, feature_value) tuples.
+"""
+function action_features(action)
+    a = lowercase(string(action))
+    if startswith(a, "go ") || a in ["north","south","east","west","up","down","ne","nw","se","sw","n","s","e","w"]
+        return [(:action_type, :movement)]
+    elseif startswith(a, "take ") || startswith(a, "get ") || startswith(a, "pick ")
+        return [(:action_type, :take)]
+    elseif startswith(a, "drop ") || startswith(a, "put ")
+        return [(:action_type, :drop)]
+    elseif startswith(a, "look") || startswith(a, "examine") || startswith(a, "x ") || a == "x" || startswith(a, "read ")
+        return [(:action_type, :examine)]
+    elseif startswith(a, "open ") || startswith(a, "close ") || startswith(a, "unlock ")
+        return [(:action_type, :manipulate)]
+    else
+        return [(:action_type, :interact)]
+    end
 end
 
 """
     update!(model::TabularWorldModel, s, a, r, s′)
 
 Update the model with an observed transition.
+
+Reward posterior uses Normal-Gamma conjugate update:
+    κₙ = κ₀ + 1
+    μₙ = (κ₀μ₀ + r) / κₙ
+    αₙ = α₀ + 0.5
+    βₙ = β₀ + κ₀(r - μ₀)² / (2κₙ)
 """
 function update!(model::TabularWorldModel, s, a, r, s′)
     key = (s, a)
-    
+
     # Update transition counts
     if !haskey(model.transition_counts, key)
         model.transition_counts[key] = Dict{Any, Float64}()
     end
     model.transition_counts[key][s′] = get(model.transition_counts[key], s′, model.transition_prior) + 1.0
-    
-    # Update reward statistics (online mean and variance)
-    if !haskey(model.reward_stats, key)
-        model.reward_stats[key] = (n=0, mean=model.reward_prior_mean, sum_sq=0.0)
+
+    # Update reward posterior (Normal-Gamma conjugate update)
+    p = get(model.reward_posterior, key, model.reward_prior)
+    κₙ = p.κ + 1.0
+    μₙ = (p.κ * p.μ + r) / κₙ
+    αₙ = p.α + 0.5
+    βₙ = p.β + p.κ * (r - p.μ)^2 / (2.0 * κₙ)
+    model.reward_posterior[key] = NormalGammaPosterior(κₙ, μₙ, αₙ, βₙ)
+
+    # Feature-level reward updates
+    if !isnothing(model.feature_extractor)
+        for fkey in model.feature_extractor(s)
+            feature_key = (fkey, a)
+            fp = get(model.feature_reward_posterior, feature_key, model.reward_prior)
+            fκₙ = fp.κ + 1.0
+            fμₙ = (fp.κ * fp.μ + r) / fκₙ
+            fαₙ = fp.α + 0.5
+            fβₙ = fp.β + fp.κ * (r - fp.μ)^2 / (2.0 * fκₙ)
+            model.feature_reward_posterior[feature_key] = NormalGammaPosterior(fκₙ, fμₙ, fαₙ, fβₙ)
+        end
+        for afkey in action_features(a)
+            feature_key = (afkey, :any)
+            fp = get(model.feature_reward_posterior, feature_key, model.reward_prior)
+            fκₙ = fp.κ + 1.0
+            fμₙ = (fp.κ * fp.μ + r) / fκₙ
+            fαₙ = fp.α + 0.5
+            fβₙ = fp.β + fp.κ * (r - fp.μ)^2 / (2.0 * fκₙ)
+            model.feature_reward_posterior[feature_key] = NormalGammaPosterior(fκₙ, fμₙ, fαₙ, fβₙ)
+        end
     end
-    
-    stats = model.reward_stats[key]
-    n_new = stats.n + 1
-    delta = r - stats.mean
-    mean_new = stats.mean + delta / n_new
-    delta2 = r - mean_new
-    sum_sq_new = stats.sum_sq + delta * delta2
-    
-    model.reward_stats[key] = (n=n_new, mean=mean_new, sum_sq=sum_sq_new)
-    
+
     # Track known states
     push!(model.known_states, s)
     push!(model.known_states, s′)
-    
+
     return nothing
 end
 
@@ -109,67 +197,111 @@ function transition_dist(model::TabularWorldModel, s, a)
 end
 
 """
-    reward_dist(model::TabularWorldModel, s, a) → Normal
+    collect_posteriors(model::TabularWorldModel, s, a) → Vector{NormalGammaPosterior}
+
+Collect all relevant posteriors for a (state, action) pair: tabular + features.
+"""
+function collect_posteriors(model::TabularWorldModel, s, a)
+    tab = get(model.reward_posterior, (s, a), model.reward_prior)
+    if isnothing(model.feature_extractor)
+        return [tab]
+    end
+
+    posteriors = NormalGammaPosterior[tab]
+    for fkey in model.feature_extractor(s)
+        fk = (fkey, a)
+        if haskey(model.feature_reward_posterior, fk)
+            push!(posteriors, model.feature_reward_posterior[fk])
+        end
+    end
+    for afkey in action_features(a)
+        fk = (afkey, :any)
+        if haskey(model.feature_reward_posterior, fk)
+            push!(posteriors, model.feature_reward_posterior[fk])
+        end
+    end
+    return posteriors
+end
+
+"""
+    combine_posteriors(posteriors::Vector{NormalGammaPosterior}) → NormalGammaPosterior
+
+Precision-weighted combination of Normal-Gamma posteriors.
+
+κ acts as precision (more observations → higher κ → more weight).
+    μ_combined = Σ(κᵢ·μᵢ) / Σ(κᵢ)
+    α_combined = mean(αᵢ)
+    β_combined = mean(βᵢ)
+"""
+function combine_posteriors(posteriors::Vector{NormalGammaPosterior})
+    κ_total = sum(p.κ for p in posteriors)
+    μ_combined = sum(p.κ * p.μ for p in posteriors) / κ_total
+    α_combined = sum(p.α for p in posteriors) / length(posteriors)
+    β_combined = sum(p.β for p in posteriors) / length(posteriors)
+    return NormalGammaPosterior(κ_total, μ_combined, α_combined, β_combined)
+end
+
+"""
+    reward_dist(model::TabularWorldModel, s, a) → LocationScale{TDist}
 
 Return the posterior predictive distribution over rewards.
+
+The posterior predictive of a Normal-Gamma model is a (scaled, shifted) t-distribution:
+    r ~ t_{2α}(μ, √(β(κ+1)/(ακ)))
+
+When a feature_extractor is present, combines tabular and feature-level posteriors
+via precision-weighted averaging before computing the predictive distribution.
 """
 function reward_dist(model::TabularWorldModel, s, a)
-    key = (s, a)
-    
-    if !haskey(model.reward_stats, key) || model.reward_stats[key].n == 0
-        # No observations — return prior
-        return Normal(model.reward_prior_mean, sqrt(model.reward_prior_variance))
-    end
-    
-    stats = model.reward_stats[key]
-    
-    if stats.n == 1
-        # Single observation — use prior variance
-        return Normal(stats.mean, sqrt(model.reward_prior_variance))
-    end
-    
-    # Posterior predictive (approximation)
-    variance = stats.sum_sq / (stats.n - 1)
-    std = sqrt(max(variance, 1e-6))
-    
-    return Normal(stats.mean, std)
+    posteriors = collect_posteriors(model, s, a)
+    p = length(posteriors) == 1 ? posteriors[1] : combine_posteriors(posteriors)
+
+    df = 2.0 * p.α
+    scale = sqrt(p.β * (p.κ + 1.0) / (p.α * p.κ))
+
+    return LocationScale(p.μ, scale, TDist(df))
 end
 
 """
     sample_dynamics(model::TabularWorldModel) → SampledDynamics
 
 Sample a concrete dynamics model from the posterior for Thompson Sampling.
-Returns a callable object that gives deterministic transitions and rewards.
+
+For each observed (s,a), samples:
+- Transition probs from Dirichlet posterior
+- Reward from Normal-Gamma posterior: σ² ~ InvGamma(α,β), then r ~ Normal(μ, σ²/κ)
+
+For unobserved (s,a), rewards are lazily sampled from the prior (wide distribution).
 """
 function sample_dynamics(model::TabularWorldModel)
     # Sample transition probabilities from Dirichlet posteriors
     sampled_transitions = Dict{Tuple{Any,Any}, Any}()
-    
+
     for (key, counts) in model.transition_counts
         states = collect(keys(counts))
         alphas = [counts[s] for s in states]
-        
-        # Sample from Dirichlet
         probs = rand(Dirichlet(alphas))
-        
-        # Store as categorical distribution
         sampled_transitions[key] = (states=states, probs=probs)
     end
-    
-    # Sample reward means from Normal posteriors
+
+    # Sample rewards from Normal-Gamma posteriors (combined with features if available)
     sampled_rewards = Dict{Tuple{Any,Any}, Float64}()
-    
-    for (key, stats) in model.reward_stats
-        dist = reward_dist(model, key[1], key[2])
-        sampled_rewards[key] = rand(dist)
+
+    for (key, _) in model.reward_posterior
+        s, a = key
+        posteriors = collect_posteriors(model, s, a)
+        p = length(posteriors) == 1 ? posteriors[1] : combine_posteriors(posteriors)
+        # Sample σ² ~ InvGamma(α, β), then μ ~ Normal(μ_post, σ²/κ)
+        σ² = rand(InverseGamma(p.α, p.β))
+        r = rand(Normal(p.μ, sqrt(σ² / p.κ)))
+        sampled_rewards[key] = r
     end
-    
+
     return SampledDynamics(
         sampled_transitions,
         sampled_rewards,
         model.known_states,
-        model.reward_prior_mean,
-        model.reward_prior_variance
+        model.reward_prior
     )
 end
 
@@ -185,8 +317,7 @@ mutable struct SampledDynamics
     transitions::Dict{Tuple{Any,Any}, Any}
     rewards::Dict{Tuple{Any,Any}, Float64}
     known_states::Set{Any}
-    reward_prior_mean::Float64
-    reward_prior_variance::Float64
+    reward_prior::NormalGammaPosterior
 end
 
 """
@@ -222,7 +353,7 @@ end
 
 Get the sampled reward for a state-action pair.
 
-For unknown (s,a), lazily samples from Normal(prior_mean, √prior_var) and caches
+For unknown (s,a), lazily samples from the Normal-Gamma prior and caches
 the result. This ensures different Thompson samples see different rewards for
 untried actions (exploration) while each sample is internally consistent (coherent planning).
 """
@@ -231,8 +362,10 @@ function get_reward(dynamics::SampledDynamics, s, a)
     if haskey(dynamics.rewards, key)
         return dynamics.rewards[key]
     end
-    # Sample from prior and cache for consistency within this Thompson sample
-    r = rand(Normal(dynamics.reward_prior_mean, sqrt(dynamics.reward_prior_variance)))
+    # Sample from Normal-Gamma prior and cache for consistency
+    p = dynamics.reward_prior
+    σ² = rand(InverseGamma(p.α, p.β))
+    r = rand(Normal(p.μ, sqrt(σ² / p.κ)))
     dynamics.rewards[key] = r
     return r
 end

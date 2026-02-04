@@ -76,6 +76,17 @@ function (oracle::OracleClient)(prompt::String)
 end
 
 # ============================================================================
+# STATE PREPROCESSING
+# ============================================================================
+
+"""
+Strip agent_energy and steps from the observation (they change every tick,
+making every state unique). Keep agent_pos and food layout — these are
+strategically relevant (food disappears when eaten).
+"""
+gridworld_preprocess(obs) = (agent_pos = obs.agent_pos, food = obs.food)
+
+# ============================================================================
 # MAIN EXPERIMENT
 # ============================================================================
 
@@ -103,14 +114,18 @@ function run_experiment(;
     
     # Create planner
     planner = ThompsonMCTS(
-        iterations = 50,
-        depth = 5,
+        iterations = 80,
+        depth = 8,
         discount = 0.99,
         ucb_c = 2.0
     )
     
-    # Create state abstractor
-    abstractor = IdentityAbstractor()  # Start simple; can upgrade to Bisimulation
+    # Create state abstractor with preprocessing to collapse the state space
+    abstractor = BisimulationAbstractor(
+        similarity_threshold = 0.95,
+        reward_threshold = 0.1,
+        preprocess_fn = gridworld_preprocess
+    )
     
     # Create sensor (optional)
     sensors = Sensor[]
@@ -125,8 +140,8 @@ function run_experiment(;
         world, model, planner, abstractor;
         sensors = sensors,
         config = AgentConfig(
-            planning_depth = 5,
-            mcts_iterations = 50,
+            planning_depth = 8,
+            mcts_iterations = 80,
             sensor_cost = 0.01
         )
     )
@@ -165,6 +180,9 @@ function run_experiment(;
         println(@sprintf("  TPR: %.3f (queries: %d)", tpr(sensor), sensor.n_queries))
         println(@sprintf("  FPR: %.3f", fpr(sensor)))
     end
+
+    println()
+    println(abstraction_summary(abstractor))
     
     return (
         rewards = episode_rewards,
