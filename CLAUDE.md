@@ -20,6 +20,36 @@ Julia ≥ 1.9 required. Project.toml is at the repo root.
     # Run tests (once test/ exists)
     julia --project=. -e 'using Pkg; Pkg.test()'
 
+## Playing Interactive Fiction Games
+
+The agent can play text adventure games (IF) via Jericho. Requires: `pip install jericho`
+
+    # Play Enchanter game without LLM
+    julia --project=. examples/jericho_agent.jl /path/to/enchanter.z3 --episodes 5 --steps 100
+
+    # Play with LLM guidance (requires Ollama running: ollama serve)
+    # First pull a model: ollama pull llama3.1
+    julia --project=. examples/jericho_agent.jl /path/to/enchanter.z3 --llm --model llama3.1 --episodes 5 --steps 100
+
+    # Common options:
+    --llm                 # Enable LLM sensor for state analysis and action selection
+    --model llama3.1      # Specify LLM model (requires ollama to have it installed)
+    --episodes 5          # Number of episodes to run (default 3)
+    --steps 100           # Max steps per episode (default 50)
+    --verbose             # Print detailed debug output
+    --mcts-iterations 100 # MCTS samples per decision (default 60)
+    --mcts-depth 10       # Planning horizon (default 8)
+
+Game files location: `/home/g/Sync/git/bayesian-agents/bayesian-if-agent/games/`
+Available games: enchanter.z3, (others in games/ directory)
+
+How it works:
+1. Agent abstracts game state to location|inventory_hash to learn world model
+2. Thompson Sampling MCTS plans 8-20 steps ahead
+3. LLM sensor (if enabled) analyzes game text, identifies obstacles and promising actions
+4. VOI-gated queries: only asks LLM when action beliefs are uncertain
+5. Null outcome detection: marks repeated "look X" commands as confirmed no-ops to avoid looping
+
 ## Architecture
 
 Core module: `src/BayesianAgents.jl` — defines 5 abstract interfaces and the agent loop (`act!`, `run_episode!`).
