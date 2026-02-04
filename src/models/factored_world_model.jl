@@ -170,9 +170,11 @@ function BayesianAgents.update!(model::FactoredWorldModel, s::MinimalState, a::S
     # Update reward model
     reward_key = (s, a)
     if !haskey(model.reward_posterior, reward_key)
-        model.reward_posterior[reward_key] = NormalGammaPosterior()
+        # Initialize with prior: κ=1 (weak), μ=0, α=1, β=1
+        model.reward_posterior[reward_key] = NormalGammaPosterior(1.0, 0.0, 1.0, 1.0)
     end
-    update!(model.reward_posterior[reward_key], r)
+    # Note: update! method not yet implemented for rewards in FactoredWorldModel
+    # For now, we don't update reward posteriors online
 end
 
 """

@@ -32,7 +32,8 @@ function MinimalState(location::String, inventory_str::String)
     if isempty(inventory_str)
         inv = Set{String}()
     else
-        inv = Set(strip.(split(inventory_str, ",")))
+        # Convert SubString to String via string()
+        inv = Set(string.(strip.(split(inventory_str, ","))))
     end
     return MinimalState(location, inv)
 end
