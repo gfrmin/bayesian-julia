@@ -788,6 +788,7 @@ include("probability/cpd.jl")
 # State representation
 include("state/minimal_state.jl")
 include("state/state_belief.jl")
+include("state/variable_discovery.jl")  # Stage 2
 
 # Factored world model
 include("models/factored_world_model.jl")
@@ -797,6 +798,15 @@ include("inference/bayesian_update.jl")
 
 # Factored planning
 include("planning/factored_mcts.jl")
+
+# Stage 3: Structure Learning
+include("structure/structure_learning.jl")
+
+# Stage 4: Action Schemas
+include("actions/action_schema.jl")
+
+# Stage 5: Goal-Directed Planning
+include("planning/goal_planning.jl")
 
 # World adapters
 include("worlds/gridworld.jl")
@@ -815,6 +825,26 @@ export StateBelief, add_object!, update_from_state!, sample_state, predict_state
 export FactoredWorldModel, SampledFactoredDynamics, add_location!, sample_next_state, mark_selfloop!, is_selfloop
 export FactoredMCTS, FactoredMCTSNode, mcts_search
 export update_location_belief!, update_inventory_belief!, bayesian_update_belief!, predict_from_likelihood
+
+# Stage 2: Variable Discovery exports
+export VariableCandidate, extract_candidate_variables, compute_bic, compute_bic_delta
+export should_accept_variable, discover_variables!, update_state_belief_with_discovery!
+
+# Stage 3: Structure Learning exports
+export DirectedGraph, add_edge!, remove_edge!, get_parents, is_acyclic
+export bde_score, learn_structure_greedy, LearnedStructure
+export learn_action_structure, compute_action_scope
+
+# Stage 4: Action Schemas exports
+export ActionSchema, ActionInstance
+export extract_action_type, cluster_actions, infer_schema_from_cluster
+export discover_schemas, apply_schema, zero_shot_transfer_likelihood
+
+# Stage 5: Goal-Directed Planning exports
+export Goal, extract_goals_from_text, compute_goal_progress, expected_goal_progress
+export goal_biased_action_selection, update_goal_status!
+export intrinsic_motivation_reward
+export ValueOfInformation, compute_voi_for_query
 
 # Legacy exports
 export GridWorld, spawn_food!
