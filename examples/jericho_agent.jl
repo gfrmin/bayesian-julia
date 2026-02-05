@@ -129,10 +129,12 @@ function run_jericho_experiment(;
     n_episodes::Int = 5,
     max_steps::Int = 50,
     use_llm::Bool = false,
+    force_llm::Bool = false,
     ollama_model::String = "llama3.2",
     mcts_iterations::Int = 60,
     mcts_depth::Int = 8,
     verbose::Bool = true,
+    enable_stage2::Bool = false,
     enable_stage3::Bool = false,
     enable_stage4::Bool = false,
     enable_stage5::Bool = false
@@ -171,11 +173,15 @@ function run_jericho_experiment(;
     sensors = Sensor[]
     if use_llm
         println("Connecting to Ollama ($ollama_model)...")
-        client = make_ollama_client(model=ollama_model)
+        client = make_ollama_client(model=ollama_model, timeout=60)
         # Test connection
         test_response = client.query("Say 'ok'.")
         if isempty(test_response)
-            @warn "Ollama not responding — continuing without LLM sensor"
+            if force_llm
+                error("Ollama not responding and --force-llm specified. Start Ollama with: ollama serve")
+            else
+                @warn "Ollama not responding — continuing without LLM sensor"
+            end
         else
             println("Ollama connected: $(strip(test_response))")
             # Skeptical prior: uniform Beta(1,1) for both TPR and FPR.
@@ -197,6 +203,9 @@ function run_jericho_experiment(;
             mcts_iterations = mcts_iterations,
             sensor_cost = 0.01,
             max_queries_per_step = 3,
+            enable_variable_discovery = enable_stage2,
+            variable_discovery_frequency = 20,
+            variable_bic_threshold = 0.0,
             enable_structure_learning = enable_stage3,
             structure_learning_frequency = 50,
             enable_action_schemas = enable_stage4,
@@ -310,10 +319,12 @@ function parse_args(args)
     n_episodes = 5
     max_steps = 50
     use_llm = false
+    force_llm = false
     ollama_model = "llama3.2"
     verbose = true
     mcts_iterations = 60
     mcts_depth = 8
+    enable_stage2 = false
     enable_stage3 = false
     enable_stage4 = false
     enable_stage5 = false
@@ -329,6 +340,9 @@ function parse_args(args)
             max_steps = parse(Int, args[i])
         elseif arg == "--llm"
             use_llm = true
+        elseif arg == "--force-llm"
+            use_llm = true
+            force_llm = true
         elseif arg == "--model" && i < length(args)
             i += 1
             ollama_model = args[i]
@@ -344,6 +358,8 @@ function parse_args(args)
             verbose = true
         elseif arg == "--debug"
             ENV["JULIA_DEBUG"] = "Main.BayesianAgents"
+        elseif arg == "--stage2"
+            enable_stage2 = true
         elseif arg == "--stage3"
             enable_stage3 = true
         elseif arg == "--stage4"
@@ -351,6 +367,7 @@ function parse_args(args)
         elseif arg == "--stage5"
             enable_stage5 = true
         elseif arg == "--all-stages"
+            enable_stage2 = true
             enable_stage3 = true
             enable_stage4 = true
             enable_stage5 = true
@@ -390,10 +407,12 @@ function parse_args(args)
         n_episodes = n_episodes,
         max_steps = max_steps,
         use_llm = use_llm,
+        force_llm = force_llm,
         ollama_model = ollama_model,
         verbose = verbose,
         mcts_iterations = mcts_iterations,
         mcts_depth = mcts_depth,
+        enable_stage2 = enable_stage2,
         enable_stage3 = enable_stage3,
         enable_stage4 = enable_stage4,
         enable_stage5 = enable_stage5
@@ -407,10 +426,12 @@ if abspath(PROGRAM_FILE) == @__FILE__
         n_episodes = opts.n_episodes,
         max_steps = opts.max_steps,
         use_llm = opts.use_llm,
+        force_llm = opts.force_llm,
         ollama_model = opts.ollama_model,
         verbose = opts.verbose,
         mcts_iterations = opts.mcts_iterations,
         mcts_depth = opts.mcts_depth,
+        enable_stage2 = opts.enable_stage2,
         enable_stage3 = opts.enable_stage3,
         enable_stage4 = opts.enable_stage4,
         enable_stage5 = opts.enable_stage5

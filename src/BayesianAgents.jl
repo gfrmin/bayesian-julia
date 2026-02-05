@@ -669,6 +669,22 @@ function act!(agent::BayesianAgent)
     # Store observation text for LLM context history
     push!(agent.observation_history, (action, extract_observation_text(obs)))
 
+    # ================================================================
+    # PHASE 2: HIDDEN VARIABLE INFERENCE (if LLM sensor available)
+    # ================================================================
+    if !isempty(agent.sensors)
+        llm_idx = findfirst(s -> s isa LLMSensor, agent.sensors)
+        if !isnothing(llm_idx)
+            obs_text = extract_observation_text(obs)
+            try
+                infer_hidden_variables!(s′, obs_text, agent.sensors[llm_idx])
+                @debug "Hidden vars inferred" spells=s′.spells_known objects=s′.object_states knowledge=s′.knowledge_gained
+            catch e
+                @debug "Hidden variable inference failed" error=e
+            end
+        end
+    end
+
     # Update model
     update!(agent.model, s, action, reward, s′)
 
@@ -912,6 +928,9 @@ export update_location_belief!, update_inventory_belief!, bayesian_update_belief
 # Stage 2: Variable Discovery exports
 export VariableCandidate, extract_candidate_variables, compute_bic, compute_bic_delta
 export should_accept_variable, discover_variables!, update_state_belief_with_discovery!
+
+# Hidden variable inference (Phase 2)
+export infer_hidden_variables!, extract_spell_name, extract_object_states, extract_knowledge
 
 # Stage 3: Structure Learning exports
 export DirectedGraph, add_edge!, remove_edge!, get_parents, is_acyclic
