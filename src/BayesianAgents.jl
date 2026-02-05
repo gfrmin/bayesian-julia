@@ -783,6 +783,7 @@ include("models/binary_sensor.jl")
 include("planners/thompson_mcts.jl")
 include("abstractors/identity_abstractor.jl")
 include("abstractors/bisimulation_abstractor.jl")
+include("abstractors/minimal_state_abstractor.jl")
 
 # ============================================================================
 # STAGE 1: MVBN (Minimum Viable Bayesian Network) - NEW COMPONENTS
@@ -856,7 +857,7 @@ export ValueOfInformation, compute_voi_for_query
 export GridWorld, spawn_food!
 export TabularWorldModel, NormalGammaPosterior, SampledDynamics, get_reward, information_gain
 export ThompsonMCTS, MCTSNode, plan_with_priors, select_rollout_action
-export IdentityAbstractor, BisimulationAbstractor, abstraction_summary
+export IdentityAbstractor, BisimulationAbstractor, MinimalStateAbstractor, abstraction_summary
 export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome, StateAnalysis, query_state_analysis, parse_state_analysis, apply_state_analysis_priors!
 export extract_observation_text, build_llm_context
 export action_features, collect_posteriors, combine_posteriors

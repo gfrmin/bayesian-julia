@@ -11,6 +11,25 @@ exploration and exploitation.
 using Random
 
 """
+    get_confirmed_selfloops(dynamics) → Set
+
+Get confirmed self-loops from either SampledDynamics or SampledFactoredDynamics.
+Works with both TabularWorldModel's SampledDynamics and FactoredWorldModel's
+SampledFactoredDynamics by checking field availability and nesting.
+"""
+function get_confirmed_selfloops(dynamics)
+    if hasfield(typeof(dynamics), :confirmed_selfloops)
+        return dynamics.confirmed_selfloops
+    elseif hasfield(typeof(dynamics), :model)
+        # SampledFactoredDynamics wraps a model
+        if hasfield(typeof(dynamics.model), :confirmed_selfloops)
+            return dynamics.model.confirmed_selfloops
+        end
+    end
+    return Set()
+end
+
+"""
     MCTSNode
 
 A node in the MCTS search tree.
@@ -373,13 +392,8 @@ the transition structure — no chasing rewards from other states.
 """
 function select_rollout_action(dynamics, state, actions)
     # Filter out confirmed self-loops if there are alternatives
-    # (Works with both SampledDynamics and SampledFactoredDynamics)
-    if hasfield(typeof(dynamics), :confirmed_selfloops)
-        viable = filter(a -> !((state, a) in dynamics.confirmed_selfloops), actions)
-    else
-        # SampledFactoredDynamics: check via model
-        viable = filter(a -> !((state, a) in dynamics.model.confirmed_selfloops), actions)
-    end
+    selfloops = get_confirmed_selfloops(dynamics)
+    viable = filter(a -> !((state, a) in selfloops), actions)
     if isempty(viable)
         viable = actions
     end

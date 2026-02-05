@@ -2,13 +2,13 @@
     Bayesian Agent Example: Interactive Fiction via Jericho
 
 This example demonstrates the **5-stage Bayesian framework** on IF games:
-1. **Stage 1: MVBN** - MinimalState (location, inventory) with FactoredWorldModel
-2. **Stage 2: Variable Discovery** - Auto-discover state variables from text
-3. **Stage 3: Structure Learning** - Learn causal dependencies (Bayesian networks)
-4. **Stage 4: Action Schemas** - Generalize across action instances
-5. **Stage 5: Goal Planning** - Extract objectives, plan toward goals
-6. **LLM Integration** - Ollama sensor with VOI-gated queries
+1. **Stage 1: MVBN** ✓ - MinimalState (location, inventory) with FactoredWorldModel (ACTIVE)
+2. **Stage 2: Variable Discovery** - Auto-discover state variables from text (coming soon)
+3. **Stage 3: Structure Learning** - Learn causal dependencies (Bayesian networks) (coming soon)
+4. **Stage 4: Action Schemas** - Generalize across action instances (coming soon)
+5. **Stage 5: Goal Planning** - Extract objectives, plan toward goals (coming soon)
 
+Stage 1 implements factored state representation with Dirichlet-Categorical dynamics learning.
 All learning via Bayesian inference. No heuristics.
 
 Requirements:
@@ -149,15 +149,9 @@ function run_jericho_experiment(;
     println("Max score: $(world.max_score)")
     println()
 
-    # Create world model: FactoredWorldModel (Stage 1) requires planner refactor.
-    # For now, use TabularWorldModel (legacy) which is compatible with existing MCTS
-    # TODO: Create FactoredMCTS planner for full 5-stage integration
-    model = TabularWorldModel(
-        transition_prior = 0.1,
-        reward_prior_mean = 0.0,
-        reward_prior_variance = 1.0,
-        feature_extractor = jericho_features
-    )
+    # Stage 1: MVBN with factored state representation
+    # Learns P(location' | location, action) and P(obj' | obj, action)
+    model = FactoredWorldModel(0.1)  # Dirichlet concentration prior
 
     # Create planner
     planner = ThompsonMCTS(
@@ -167,8 +161,8 @@ function run_jericho_experiment(;
         ucb_c = 2.0
     )
 
-    # Create state abstractor
-    abstractor = JerichoStateAbstractor()
+    # Stage 1: Factored state extraction (location, inventory)
+    abstractor = MinimalStateAbstractor()
 
     # Create sensors
     sensors = Sensor[]
