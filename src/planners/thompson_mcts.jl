@@ -398,23 +398,28 @@ function select_rollout_action(dynamics, state, actions)
         viable = actions
     end
 
-    best_r = -Inf
-    best_a = nothing
+    # Try reward-based selection if rewards are available (TabularWorldModel)
+    if hasfield(typeof(dynamics), :rewards)
+        best_r = -Inf
+        best_a = nothing
 
-    for a in viable
-        key = (state, a)
-        if haskey(dynamics.rewards, key)
-            r = dynamics.rewards[key]
-            if r > best_r
-                best_r = r
-                best_a = a
+        for a in viable
+            key = (state, a)
+            if haskey(dynamics.rewards, key)
+                r = dynamics.rewards[key]
+                if r > best_r
+                    best_r = r
+                    best_a = a
+                end
             end
+        end
+
+        if !isnothing(best_a) && best_r > 0
+            return best_a
         end
     end
 
-    if !isnothing(best_a) && best_r > 0
-        return best_a
-    end
+    # Fallback: random selection (for FactoredWorldModel or no positive rewards)
     return rand(viable)
 end
 
