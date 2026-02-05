@@ -235,8 +235,16 @@ function run_jericho_experiment(;
         println(@sprintf("  Score:  %d / %d", world.current_score, world.max_score))
         println(@sprintf("  Steps:  %d", agent.step_count))
         println(@sprintf("  Reward: %.1f", agent.total_reward))
-        println(@sprintf("  States learned: %d", length(model.known_states)))
-        println(@sprintf("  Transitions:    %d", length(model.transition_counts)))
+
+        # Model-agnostic state/transition reporting
+        if isa(model, TabularWorldModel)
+            println(@sprintf("  States learned: %d", length(model.known_states)))
+            println(@sprintf("  Transitions:    %d", length(model.transition_counts)))
+        elseif isa(model, FactoredWorldModel)
+            num_states = length(model.known_locations) * length(model.known_objects)
+            println(@sprintf("  State space:    %d", num_states))
+            println(@sprintf("  Transitions:    %d", length(model.transitions)))
+        end
         println()
         flush(stdout)
     end
@@ -248,8 +256,16 @@ function run_jericho_experiment(;
     println(@sprintf("Episodes:         %d", n_episodes))
     println(@sprintf("Average reward:   %.2f", _mean(episode_rewards)))
     println(@sprintf("Best score:       %d / %d", maximum(episode_scores), world.max_score))
-    println(@sprintf("States learned:   %d", length(model.known_states)))
-    println(@sprintf("Transitions:      %d", length(model.transition_counts)))
+
+    # Model-agnostic reporting
+    if isa(model, TabularWorldModel)
+        println(@sprintf("States learned:   %d", length(model.known_states)))
+        println(@sprintf("Transitions:      %d", length(model.transition_counts)))
+    elseif isa(model, FactoredWorldModel)
+        num_states = length(model.known_locations) * length(model.known_objects)
+        println(@sprintf("State space:      %d", num_states))
+        println(@sprintf("Transitions:      %d", length(model.transitions)))
+    end
 
     if !isempty(sensors)
         for sensor in sensors
