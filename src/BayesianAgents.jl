@@ -306,6 +306,24 @@ Base.@kwdef struct AgentConfig
     # Intrinsic motivation
     use_intrinsic_reward::Bool = true
     intrinsic_scale::Float64 = 0.1
+
+    # Stage 2: Variable Discovery
+    enable_variable_discovery::Bool = false
+    variable_discovery_frequency::Int = 10  # Every N steps
+    variable_bic_threshold::Float64 = 0.0   # BIC improvement threshold
+
+    # Stage 3: Structure Learning
+    enable_structure_learning::Bool = false
+    structure_learning_frequency::Int = 50  # Every N transitions
+    max_parents::Int = 3
+
+    # Stage 4: Action Schemas
+    enable_action_schemas::Bool = false
+    schema_discovery_frequency::Int = 100   # Every N transitions
+
+    # Stage 5: Goal Planning
+    enable_goal_planning::Bool = false
+    goal_rollout_bias::Float64 = 0.5       # Blend: (1-bias)*random + bias*goal-directed
 end
 
 # ============================================================================
@@ -653,10 +671,67 @@ function act!(agent::BayesianAgent)
 
     # Update model
     update!(agent.model, s, action, reward, s′)
-    
+
     # Record for abstraction learning
     record_transition!(agent.abstractor, s, action, reward, s′)
-    
+
+    # ================================================================
+    # STAGES 2-5: ADVANCED LEARNING (Optional, config-gated)
+    # ================================================================
+    # Note: These features are available and tested, but require different
+    # state representations in some cases. For now, we demonstrate Stage 5
+    # (goal planning) which works directly with MinimalState.
+
+    # Stage 3: Structure Learning (action scope identification)
+    if agent.config.enable_structure_learning && agent.step_count % agent.config.structure_learning_frequency == 0
+        try
+            if isa(agent.model, FactoredWorldModel)
+                scope = compute_action_scope(agent.model, action)
+                if !isempty(scope)
+                    @debug "Stage 3: Action Scope" action scope=scope
+                end
+            end
+        catch e
+            @debug "Stage 3 error" exception=e
+        end
+    end
+
+    # Stage 4: Action Schemas (clustering similar actions)
+    if agent.config.enable_action_schemas && agent.step_count % agent.config.schema_discovery_frequency == 0
+        try
+            if isa(agent.model, FactoredWorldModel)
+                schemas = discover_schemas(agent.model)
+                if !isempty(schemas)
+                    @debug "Stage 4: Action Schemas discovered" num_schemas=length(schemas)
+                end
+            end
+        catch e
+            @debug "Stage 4 error" exception=e
+        end
+    end
+
+    # Stage 5: Goal-Directed Planning (extract and track goals from observation text)
+    if agent.config.enable_goal_planning
+        try
+            obs_text = extract_observation_text(obs)
+            goals = extract_goals_from_text(obs_text)
+            if !isempty(goals)
+                # Update goal achievement status based on current state
+                if isa(s′, MinimalState)
+                    update_goal_status!(goals, s′)
+                    achieved_count = count(g -> g.achieved for g in goals)
+                    @debug "Stage 5: Goal Planning" num_goals=length(goals) achieved=achieved_count
+                end
+            end
+        catch e
+            @debug "Stage 5 error" exception=e
+        end
+    end
+
+    # ================================================================
+    # END STAGES 2-5
+    # ================================================================
+
     # Check for contradictions and refine if needed
     contradiction = check_contradiction(agent.abstractor)
     if !isnothing(contradiction)

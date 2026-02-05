@@ -132,7 +132,10 @@ function run_jericho_experiment(;
     ollama_model::String = "llama3.2",
     mcts_iterations::Int = 60,
     mcts_depth::Int = 8,
-    verbose::Bool = true
+    verbose::Bool = true,
+    enable_stage3::Bool = false,
+    enable_stage4::Bool = false,
+    enable_stage5::Bool = false
 )
     println("=" ^ 60)
     println("BAYESIAN IF AGENT")
@@ -193,7 +196,12 @@ function run_jericho_experiment(;
             planning_depth = mcts_depth,
             mcts_iterations = mcts_iterations,
             sensor_cost = 0.01,
-            max_queries_per_step = 3
+            max_queries_per_step = 3,
+            enable_structure_learning = enable_stage3,
+            structure_learning_frequency = 50,
+            enable_action_schemas = enable_stage4,
+            schema_discovery_frequency = 100,
+            enable_goal_planning = enable_stage5
         )
     )
 
@@ -283,6 +291,9 @@ function parse_args(args)
     verbose = true
     mcts_iterations = 60
     mcts_depth = 8
+    enable_stage3 = false
+    enable_stage4 = false
+    enable_stage5 = false
 
     i = 1
     while i <= length(args)
@@ -310,6 +321,16 @@ function parse_args(args)
             verbose = true
         elseif arg == "--debug"
             ENV["JULIA_DEBUG"] = "Main.BayesianAgents"
+        elseif arg == "--stage3"
+            enable_stage3 = true
+        elseif arg == "--stage4"
+            enable_stage4 = true
+        elseif arg == "--stage5"
+            enable_stage5 = true
+        elseif arg == "--all-stages"
+            enable_stage3 = true
+            enable_stage4 = true
+            enable_stage5 = true
         elseif !startswith(arg, "-") && isnothing(game_path)
             game_path = arg
         else
@@ -349,7 +370,10 @@ function parse_args(args)
         ollama_model = ollama_model,
         verbose = verbose,
         mcts_iterations = mcts_iterations,
-        mcts_depth = mcts_depth
+        mcts_depth = mcts_depth,
+        enable_stage3 = enable_stage3,
+        enable_stage4 = enable_stage4,
+        enable_stage5 = enable_stage5
     )
 end
 
@@ -363,6 +387,9 @@ if abspath(PROGRAM_FILE) == @__FILE__
         ollama_model = opts.ollama_model,
         verbose = opts.verbose,
         mcts_iterations = opts.mcts_iterations,
-        mcts_depth = opts.mcts_depth
+        mcts_depth = opts.mcts_depth,
+        enable_stage3 = opts.enable_stage3,
+        enable_stage4 = opts.enable_stage4,
+        enable_stage5 = opts.enable_stage5
     )
 end
