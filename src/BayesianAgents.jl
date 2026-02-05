@@ -877,6 +877,7 @@ include("models/factored_world_model.jl")
 
 # State inference
 include("inference/bayesian_update.jl")
+include("inference/hidden_variable_inference.jl")
 
 # Factored planning
 include("planning/factored_mcts.jl")

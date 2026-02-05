@@ -205,7 +205,7 @@ function run_jericho_experiment(;
         )
     )
 
-    # Run episodes
+    # Run episodes - Agent created ONCE, model accumulates knowledge across episodes
     episode_rewards = Float64[]
     episode_scores = Int[]
 
@@ -215,8 +215,15 @@ function run_jericho_experiment(;
         println("-" ^ 60)
         flush(stdout)
 
+        # Reset world state and episode tracking, but NOT the model
+        agent.current_observation = reset!(world)
+        agent.current_abstract_state = abstract_state(agent.abstractor, agent.current_observation)
+        agent.step_count = 0
+        agent.total_reward = 0.0
+        agent.trajectory = []
+        # NOTE: agent.model is NOT reset - it accumulates knowledge across episodes!
+
         # Manual step loop for per-step output
-        reset!(agent)
         for step in 1:max_steps
             action, obs, reward, done = act!(agent)
             r_str = reward != 0 ? " → reward $(reward)" : ""
