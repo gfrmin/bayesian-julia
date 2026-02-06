@@ -238,41 +238,87 @@ function plan end
 # ============================================================================
 
 """
-    compute_voi(sensor::Sensor, prior::Float64, actions, eu_func) → Float64
+    get_kappa(model::WorldModel, state, action) → Float64
 
-Compute the value of information for querying a binary sensor.
-
-VOI = E[max_a EU(a) | after asking] - max_a EU(a) | now
-
-Arguments:
-- sensor: The sensor to query
-- prior: Current belief P(proposition is true)
-- actions: Available actions
-- eu_func: Function mapping (action, belief) → expected utility
+Extract κ (precision / pseudo-observation count) from the reward posterior
+for a given (state, action) pair. Returns the prior κ if no observations exist.
 """
-function compute_voi(sensor::Sensor, prior::Float64, actions, eu_func)
+function get_kappa(model::WorldModel, state, action)
+    key = (state, action)
+    if hasfield(typeof(model), :reward_posterior) && haskey(model.reward_posterior, key)
+        return model.reward_posterior[key].κ
+    elseif hasfield(typeof(model), :reward_prior)
+        return model.reward_prior.κ
+    else
+        return 1.0
+    end
+end
+
+"""
+    compute_voi(sensor::Sensor, oracle_beliefs::Dict, obs_key, target_action,
+                model::WorldModel, state, actions, n_actions::Int) → Float64
+
+Compute the value of information for querying the sensor about a specific action.
+
+Uses separate likelihood models:
+- Reward posterior (Normal-Gamma): updated by real (s,a,r) only
+- Oracle beliefs (scalar [0,1]): updated by sensor queries only
+
+EU(a) = μ_reward(s,a) + oracle_belief(a) × C × κ_prior/κ(s,a)
+
+The oracle bonus decays as real rewards accumulate (κ grows), providing
+automatic transition from oracle-dominated to data-dominated decisions.
+"""
+function compute_voi(sensor::Sensor, oracle_beliefs::Dict, obs_key, target_action,
+                     model::WorldModel, state, actions, n_actions::Int)
+    w = tpr(sensor) - fpr(sensor)
+    w <= 0 && return 0.0  # Uninformative sensor
+
+    C = 1.0  # oracle bonus scale
+    default_belief = 1.0 / n_actions
+    κ_prior = hasfield(typeof(model), :reward_prior) ? model.reward_prior.κ : 1.0
+
+    # EU for each action: reward posterior mean + oracle bonus
+    function eu(a)
+        rd = reward_dist(model, state, a)
+        μ = Distributions.mean(rd)
+        μ = isfinite(μ) ? μ : 0.0
+        belief = get(oracle_beliefs, (obs_key, string(a)), default_belief)
+        κ_a = get_kappa(model, state, a)
+        return μ + belief * C * κ_prior / κ_a
+    end
+
+    current_best = maximum(eu, actions)
+
+    # Current belief for target action
+    target_str = string(target_action)
+    belief_a = get(oracle_beliefs, (obs_key, target_str), default_belief)
+
+    # P(sensor says yes) for target action
     t = tpr(sensor)
     f = fpr(sensor)
-    
-    # Current best EU
-    current_best = maximum(a -> eu_func(a, prior), actions)
-    
-    # Probability sensor says "yes"
-    p_yes = t * prior + f * (1 - prior)
-    p_no = 1 - p_yes
-    
-    # Posterior if sensor says "yes"
-    posterior_yes = posterior(sensor, prior, true)
-    best_after_yes = maximum(a -> eu_func(a, posterior_yes), actions)
-    
-    # Posterior if sensor says "no"
-    posterior_no = posterior(sensor, prior, false)
-    best_after_no = maximum(a -> eu_func(a, posterior_no), actions)
-    
-    # Expected best after asking
-    expected_best_after = p_yes * best_after_yes + p_no * best_after_no
-    
-    return expected_best_after - current_best
+    p_yes = t * belief_a + f * (1 - belief_a)
+    p_no = 1.0 - p_yes
+
+    # Hypothetical beliefs after yes/no
+    belief_yes = posterior(sensor, belief_a, true)
+    belief_no = posterior(sensor, belief_a, false)
+
+    # Only target action's EU changes after query
+    rd_target = reward_dist(model, state, target_action)
+    μ_target = let m = Distributions.mean(rd_target); isfinite(m) ? m : 0.0 end
+    κ_target = get_kappa(model, state, target_action)
+
+    eu_target_yes = μ_target + belief_yes * C * κ_prior / κ_target
+    eu_target_no = μ_target + belief_no * C * κ_prior / κ_target
+
+    other_best = maximum(a -> a == target_action ? -Inf : eu(a), actions; init=-Inf)
+
+    best_after_yes = max(other_best, eu_target_yes)
+    best_after_no = max(other_best, eu_target_no)
+
+    expected_best = p_yes * best_after_yes + p_no * best_after_no
+    return max(expected_best - current_best, 0.0)
 end
 
 # ============================================================================
@@ -318,6 +364,28 @@ Base.@kwdef struct AgentConfig
 end
 
 # ============================================================================
+# DECISION INFO (per-step logging)
+# ============================================================================
+
+"""
+    DecisionInfo
+
+Diagnostic information from a single act! call.
+Populated each step for logging/debugging without needing --debug.
+"""
+struct DecisionInfo
+    llm_selected::Union{Nothing, Any}     # What the LLM recommended
+    action_chosen::Any                     # What MCTS actually picked
+    top_reward_means::Vector{Pair{Any,Float64}} # Top 3 (action, posterior mean) pairs
+    top_oracle_beliefs::Vector{Pair{Any,Float64}} # Top 3 (action, oracle belief) pairs
+    n_selfloops::Int                      # Confirmed selfloops in current state
+    n_actions_available::Int               # Total actions
+    n_voi_queries::Int                    # How many oracle beliefs were updated from LLM
+    n_sensor_queries::Int                  # Number of sensor queries this step
+    planner_overrode_llm::Bool             # MCTS picked something different from LLM
+end
+
+# ============================================================================
 # AGENT
 # ============================================================================
 
@@ -344,10 +412,6 @@ mutable struct BayesianAgent{W<:World, M<:WorldModel, P<:Planner, A<:StateAbstra
     # History for credit assignment
     trajectory::Vector{NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}}
 
-    # Persistent action beliefs: (abstract_state, action) → P(action helps)
-    # Survives across steps and episodes so sensor learning is not lost
-    action_belief_cache::Dict{Tuple{Any,Any}, Float64}
-
     # Pending sensor queries awaiting ground truth: (sensor, action, said_yes, step)
     pending_sensor_queries::Vector{Tuple{Sensor, Any, Bool, Int}}
 
@@ -363,6 +427,13 @@ mutable struct BayesianAgent{W<:World, M<:WorldModel, P<:Planner, A<:StateAbstra
     # Tracks actions boosted by state analysis (for ground truth learning)
     # Maps step → Set of actions that analysis marked as promising
     analysis_boosted_actions::Dict{Int, Set{Any}}
+
+    # Oracle beliefs: (observable_key, action) → P(action helps | LLM observations)
+    # Separate from reward posterior — updated by sensor queries only, not real rewards.
+    oracle_beliefs::Dict{Tuple{Any, String}, Float64}
+
+    # Decision info from last act! call (for logging/debugging)
+    last_decision::Union{Nothing, DecisionInfo}
 end
 
 """
@@ -382,12 +453,13 @@ function BayesianAgent(
         world, model, planner, abstractor, convert(Vector{Sensor}, sensors), config,
         nothing, nothing, 0, 0, 0.0,
         NamedTuple{(:s, :a, :r, :s′), Tuple{Any, Any, Float64, Any}}[],
-        Dict{Tuple{Any,Any}, Float64}(),
         Tuple{Sensor, Any, Bool, Int}[],
         0,
         Tuple{Any, String}[],
         Dict{UInt64, Any}(),
-        Dict{Int, Set{Any}}()
+        Dict{Int, Set{Any}}(),
+        Dict{Tuple{Any, String}, Float64}(),  # oracle_beliefs
+        nothing  # last_decision
     )
 end
 
@@ -472,8 +544,8 @@ function build_llm_context(agent::BayesianAgent)
     # Globally effective actions: (state, action) pairs with positive average reward anywhere
     globally_effective = String[]
     for (key, p) in agent.model.reward_posterior
-        # κ represents effective observations in the posterior
-        n_obs = Int(p.κ - agent.model.reward_prior.κ)
+        # κ represents effective observations in the posterior (may be fractional from sensor updates)
+        n_obs = floor(Int, p.κ - agent.model.reward_prior.κ)
         if n_obs > 0 && p.μ > 0.1  # Saw positive rewards
             action_name = key[2]
             state_name = key[1]
@@ -495,8 +567,8 @@ function build_llm_context(agent::BayesianAgent)
         state_match = (s isa MinimalState && key[1] isa MinimalState) ?
             (observable_key(key[1]) == observable_key(s)) : (key[1] == s)
         if state_match
-            # κ represents effective observations in the posterior
-            n_obs = Int(p.κ - agent.model.reward_prior.κ)
+            # κ represents effective observations (may be fractional from sensor updates)
+            n_obs = floor(Int, p.κ - agent.model.reward_prior.κ)
             if n_obs > 0
                 avg_r = round(p.μ, digits=2)
                 push!(tried, "'$(key[2])' (tried $(n_obs)×, avg reward $avg_r)")
@@ -532,44 +604,24 @@ Choose and execute an action via expected utility maximisation.
 function act!(agent::BayesianAgent)
     s = agent.current_abstract_state
     available_actions = actions(agent.world, agent.current_observation)
-
-    # Remove confirmed selfloops and oscillations from consideration.
-    # Selfloops: actions that don't change observable state.
-    # Oscillations: actions that return to a recently-visited observable state.
-    # Both are confirmed zero-value transitions, not heuristic loop detection.
-    if isa(agent.model, FactoredWorldModel) && s isa MinimalState
-        viable = filter(a -> !is_selfloop(agent.model, s, a), available_actions)
-        if !isempty(viable)
-            available_actions = viable
-        end
-    end
-
-    # VOI-gated sensor queries
-    # Maintain per-action belief P(action helps) — prior is 1/N (most actions don't help)
+    n_total_actions = length(available_actions)
     n_actions = length(available_actions)
-    @debug "act! start" state=s n_actions step=agent.step_count
 
-    # Load cached beliefs or default to 1/N
-    # Use observable_key for cache lookup so hidden variable changes don't
-    # invalidate cached beliefs (location + inventory is what matters).
-    obs_key = (s isa MinimalState) ? observable_key(s) : s
-    action_beliefs = Dict(
-        a => get(agent.action_belief_cache, (obs_key, a), 1.0 / n_actions)
-        for a in available_actions
-    )
+    @debug "act! start" state=s n_actions step=agent.step_count
 
     # Track queries for ground truth updates: (sensor, action, answer)
     sensor_queries = Tuple{Sensor, Any, Bool}[]
+    _llm_selected = nothing
+    _n_voi_queries = 0
 
-    # EU function: expected utility of an action given belief that it helps.
-    # Actions believed helpful get a bonus proportional to belief.
-    eu_func = (a, belief) -> begin
-        rd = reward_dist(agent.model, s, a)
-        mean_reward = Distributions.mean(rd)
-        mean_reward + belief
+    # Count selfloops for diagnostics (not filtering)
+    n_selfloops = if isa(agent.model, FactoredWorldModel) && s isa MinimalState
+        count(a -> is_selfloop(agent.model, s, a), available_actions)
+    else
+        0
     end
 
-    # Query state analysis from LLM if beliefs are uncertain
+    # --- State analysis from LLM (search heuristic for MCTS priors) ---
     analysis_applied = false
     for sensor in agent.sensors
         sensor isa LLMSensor || continue
@@ -578,18 +630,12 @@ function act!(agent::BayesianAgent)
         local current_analysis
         if haskey(agent.state_analysis_cache, obs_hash)
             current_analysis = agent.state_analysis_cache[obs_hash]
-            apply_state_analysis_priors!(current_analysis, available_actions, action_beliefs, sensor)
             analysis_applied = true
         else
-            # VOI gate: only analyze if beliefs are uncertain
-            max_uncertainty = maximum([min(b, 1-b) for b in values(action_beliefs)]; init=0.0)
-            if max_uncertainty > 0.1
-                context = build_llm_context(agent)
-                current_analysis = query_state_analysis(sensor, context, available_actions)
-                agent.state_analysis_cache[obs_hash] = current_analysis
-                apply_state_analysis_priors!(current_analysis, available_actions, action_beliefs, sensor)
-                analysis_applied = true
-            end
+            context = build_llm_context(agent)
+            current_analysis = query_state_analysis(sensor, context, available_actions)
+            agent.state_analysis_cache[obs_hash] = current_analysis
+            analysis_applied = true
         end
 
         # Record which actions analysis boosted (for ground truth learning)
@@ -609,41 +655,58 @@ function act!(agent::BayesianAgent)
         break  # Only use state analysis from first LLM sensor
     end
 
+    # --- VOI-gated sensor queries: update oracle beliefs (NOT reward posteriors) ---
+    obs_key = (s isa MinimalState) ? observable_key(s) : s
     for sensor in agent.sensors
         if sensor isa LLMSensor
-            # LLM sensor: single selection query ("which action is best?")
-            # VOI check: use max single-action VOI as proxy for selection query value
-            max_voi = 0.0
+            # Compute VOI for each action using oracle beliefs
+            best_voi = 0.0
+            best_action_for_voi = nothing
             for a in available_actions
-                prior = action_beliefs[a]
-                (prior < 0.01 || prior > 0.99) && continue
-                voi = compute_voi(sensor, prior, available_actions,
-                    (act, belief) -> eu_func(act, act == a ? belief : action_beliefs[act]))
-                max_voi = max(max_voi, voi)
+                voi = compute_voi(sensor, agent.oracle_beliefs, obs_key, a,
+                                  agent.model, s, available_actions, n_actions)
+                if voi > best_voi
+                    best_voi = voi
+                    best_action_for_voi = a
+                end
             end
 
-            if max_voi > agent.config.sensor_cost
+            if best_voi > agent.config.sensor_cost
+                # Query LLM for action selection
                 context = build_llm_context(agent)
                 selected = query_selection(sensor, context, available_actions)
 
                 if !isnothing(selected)
-                    update_beliefs_from_selection!(sensor, available_actions, selected, action_beliefs)
+                    _llm_selected = selected
+                    _n_voi_queries += 1
                     push!(sensor_queries, (sensor, selected, true))
-                    @debug "LLM selection" sensor=sensor.name selected voi=max_voi
+
+                    # Extract local beliefs for current obs_key, update via Categorical model
+                    local_beliefs = Dict{Any, Float64}()
+                    default_belief = 1.0 / n_actions
+                    for a in available_actions
+                        local_beliefs[a] = get(agent.oracle_beliefs, (obs_key, string(a)), default_belief)
+                    end
+                    update_beliefs_from_selection!(sensor, available_actions, selected, local_beliefs)
+
+                    # Write updated beliefs back to agent.oracle_beliefs
+                    for a in available_actions
+                        agent.oracle_beliefs[(obs_key, string(a))] = local_beliefs[a]
+                    end
+
+                    @debug "LLM selection → oracle beliefs" sensor=sensor.name selected voi=best_voi beliefs=local_beliefs
                 end
             end
         else
-            # Binary sensors (oracle, heuristic): VOI-gated yes/no queries
+            # Binary sensors: VOI-gated yes/no queries → update oracle beliefs
             queries_made = 0
             while queries_made < agent.config.max_queries_per_step
                 best_voi = 0.0
                 best_action_to_ask = nothing
 
                 for a in available_actions
-                    prior = action_beliefs[a]
-                    (prior < 0.01 || prior > 0.99) && continue
-                    voi = compute_voi(sensor, prior, available_actions,
-                        (act, belief) -> eu_func(act, act == a ? belief : action_beliefs[act]))
+                    voi = compute_voi(sensor, agent.oracle_beliefs, obs_key, a,
+                                      agent.model, s, available_actions, n_actions)
                     if voi > best_voi
                         best_voi = voi
                         best_action_to_ask = a
@@ -654,46 +717,67 @@ function act!(agent::BayesianAgent)
 
                 question = "Will action \"$(best_action_to_ask)\" help make progress?"
                 answer = query(sensor, agent.current_observation, question)
-                action_beliefs[best_action_to_ask] = posterior(
-                    sensor, action_beliefs[best_action_to_ask], answer)
+
+                # Update oracle belief for this action via Bayes rule with TPR/FPR
+                action_key = (obs_key, string(best_action_to_ask))
+                default_belief = 1.0 / n_actions
+                prior_belief = get(agent.oracle_beliefs, action_key, default_belief)
+                agent.oracle_beliefs[action_key] = posterior(sensor, prior_belief, answer)
+
                 push!(sensor_queries, (sensor, best_action_to_ask, answer))
                 queries_made += 1
-                @debug "binary query" sensor=sensor.name action=best_action_to_ask answer voi=best_voi belief=action_beliefs[best_action_to_ask]
+                _n_voi_queries += 1
+                @debug "binary query → oracle belief" sensor=sensor.name action=best_action_to_ask answer voi=best_voi belief=agent.oracle_beliefs[action_key]
             end
         end
     end
 
-    # Re-enforce confirmed selfloop beliefs: ground truth (reward=0, state
-    # unchanged) overrides sensor opinions. Without this, the LLM can boost
-    # a confirmed-useless action back to high belief every step.
-    if isa(agent.model, FactoredWorldModel)
+    # --- Derive PUCT priors from oracle beliefs ---
+    action_priors = Dict{Any, Float64}()
+    default_belief = 1.0 / n_actions
+    floor_val = 1.0 / (10 * n_actions)
+    for a in available_actions
+        belief = get(agent.oracle_beliefs, (obs_key, string(a)), default_belief)
+        action_priors[a] = belief + floor_val
+    end
+
+    # Boost priors from state analysis (search heuristic — affects MCTS exploration order)
+    if analysis_applied && @isdefined(current_analysis)
+        promising_lower = [lowercase(d) for d in current_analysis.promising_directions]
         for a in available_actions
-            if is_selfloop(agent.model, s, a)
-                action_beliefs[a] = 0.001
+            a_lower = lowercase(string(a))
+            if any(d -> occursin(d, a_lower) || occursin(a_lower, d), promising_lower)
+                action_priors[a] *= 2.0  # Mild boost
             end
         end
     end
 
-    # Persist updated beliefs back to cache using observable key
-    for (a, belief) in action_beliefs
-        agent.action_belief_cache[(obs_key, a)] = belief
-    end
-
-    # Normalize beliefs as action priors for the planner
-    belief_total = sum(values(action_beliefs))
-    action_priors = if belief_total > 0
-        Dict(a => b / belief_total for (a, b) in action_beliefs)
-    else
-        Dict(a => 1.0 / n_actions for a in available_actions)
+    # Normalize
+    total = sum(values(action_priors))
+    if total > 0
+        for a in available_actions
+            action_priors[a] /= total
+        end
     end
 
     action = plan_with_priors(agent.planner, s, agent.model, available_actions, action_priors)
-    @debug "action selected" action beliefs=action_beliefs n_sensor_queries=length(sensor_queries)
+    @debug "action selected" action n_sensor_queries=length(sensor_queries)
+
+    # Snapshot top reward posterior means and oracle beliefs for decision logging
+    _top_reward_means = sort(
+        [a => let rd = reward_dist(agent.model, s, a); μ = Distributions.mean(rd); isfinite(μ) ? μ : 0.0 end
+         for a in available_actions],
+        by=last, rev=true
+    )[1:min(3, length(available_actions))]
+
+    _top_oracle_beliefs = sort(
+        [a => get(agent.oracle_beliefs, (obs_key, string(a)), 1.0 / n_actions)
+         for a in available_actions],
+        by=last, rev=true
+    )[1:min(3, length(available_actions))]
 
     # If the planner picks a different action than the LLM selected, store a
-    # negative prediction for the executed action — the LLM implicitly said
-    # "this is NOT the best action". This gives us learning signal even when
-    # the planner overrides the LLM.
+    # negative prediction for the executed action
     llm_selected = isempty(sensor_queries) ? nothing : sensor_queries[end][2]
     if !isnothing(llm_selected) && action != llm_selected
         llm_sensor = sensor_queries[end][1]
@@ -754,8 +838,6 @@ function act!(agent::BayesianAgent)
     if (text_unchanged || state_unchanged) && reward == 0.0
         resolve_null_action_queries!(agent, action)
         mark_selfloop!(agent.model, s, action)
-        s_obs_key = (s isa MinimalState) ? observable_key(s) : s
-        agent.action_belief_cache[(s_obs_key, action)] = 0.001
     end
 
     # Oscillation detection: if this action returns us to a state visited
@@ -768,10 +850,7 @@ function act!(agent::BayesianAgent)
             prev_s = agent.trajectory[i].s
             if prev_s isa MinimalState && observable_key(prev_s) == obs_key_prime &&
                obs_key_prime != s_obs_key_here && agent.trajectory[i].r == 0.0
-                # We returned to a recently-visited state: mark this action as
-                # oscillation (zero-value return transition).
                 mark_selfloop!(agent.model, s, action)
-                agent.action_belief_cache[(s_obs_key_here, action)] = 0.001
                 @debug "Oscillation detected" from=s action to=s′ returned_to=prev_s
                 break
             end
@@ -877,6 +956,19 @@ function act!(agent::BayesianAgent)
     agent.step_count += 1
     agent.total_reward += reward
 
+    # Populate decision info for logging
+    agent.last_decision = DecisionInfo(
+        _llm_selected,
+        action,
+        _top_reward_means,
+        _top_oracle_beliefs,
+        n_selfloops,
+        n_total_actions,
+        _n_voi_queries,
+        length(sensor_queries),
+        !isnothing(_llm_selected) && action != _llm_selected
+    )
+
     return action, obs, reward, done
 end
 
@@ -970,8 +1062,8 @@ export query, tpr, fpr, update_reliability!, posterior
 export sample_dynamics, update!, transition_dist, reward_dist, entropy
 export abstract_state, record_transition!, check_contradiction, refine!
 export plan
-export compute_voi
-export AgentConfig, BayesianAgent, act!, run_episode!, resolve_pending_queries!, resolve_null_action_queries!
+export compute_voi, get_kappa
+export AgentConfig, BayesianAgent, DecisionInfo, act!, run_episode!, resolve_pending_queries!, resolve_null_action_queries!
 
 # ============================================================================
 # FOUNDATIONAL COMPONENTS (needed by both legacy and Stage 1)

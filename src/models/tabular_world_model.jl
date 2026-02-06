@@ -28,6 +28,8 @@ struct NormalGammaPosterior
     β::Float64   # rate: scaled sum of squared deviations
 end
 
+Distributions.mean(p::NormalGammaPosterior) = p.μ
+
 """
     TabularWorldModel
 
@@ -275,10 +277,6 @@ When a feature_extractor is present, combines tabular and feature-level posterio
 via precision-weighted averaging before computing the predictive distribution.
 """
 function reward_dist(model::TabularWorldModel, s, a)
-    if (s, a) in model.confirmed_selfloops
-        return Normal(0.0, 1e-10)
-    end
-
     posteriors = collect_posteriors(model, s, a)
     p = length(posteriors) == 1 ? posteriors[1] : combine_posteriors(posteriors)
 
@@ -314,10 +312,6 @@ function sample_dynamics(model::TabularWorldModel)
     sampled_rewards = Dict{Tuple{Any,Any}, Float64}()
 
     for (key, _) in model.reward_posterior
-        if key in model.confirmed_selfloops
-            sampled_rewards[key] = 0.0
-            continue
-        end
         s, a = key
         posteriors = collect_posteriors(model, s, a)
         p = length(posteriors) == 1 ? posteriors[1] : combine_posteriors(posteriors)
@@ -395,9 +389,6 @@ untried actions (exploration) while each sample is internally consistent (cohere
 """
 function get_reward(dynamics::SampledDynamics, s, a)
     key = (s, a)
-    if key in dynamics.confirmed_selfloops
-        return 0.0
-    end
     if haskey(dynamics.rewards, key)
         return dynamics.rewards[key]
     end

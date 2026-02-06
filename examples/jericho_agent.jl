@@ -292,7 +292,34 @@ function run_jericho_experiment(;
             r_str = reward != 0 ? " → reward $(reward)" : ""
             sq = !isempty(agent.sensors) ? " [queries: $(agent.sensors[1].n_queries)]" : ""
             if verbose
-                print(@sprintf("  %3d. %-30s%s%s\n", step, action, r_str, sq))
+                # Decision context: LLM pick, top beliefs, selfloop filtering
+                di = agent.last_decision
+                di_str = ""
+                if !isnothing(di)
+                    parts = String[]
+                    if di.n_voi_queries > 0 && !isnothing(di.llm_selected)
+                        llm_tag = di.planner_overrode_llm ? "LLM→✗$(di.llm_selected)" : "LLM→$(di.llm_selected)"
+                        push!(parts, llm_tag)
+                    elseif di.n_voi_queries == 0
+                        push!(parts, "no-VOI")
+                    end
+                    if di.n_selfloops > 0
+                        push!(parts, "sl:$(di.n_selfloops)/$(di.n_actions_available)")
+                    end
+                    # Top actions: reward posterior mean + oracle belief
+                    if !isempty(di.top_reward_means)
+                        top_parts = String[]
+                        for (i, (a, μ)) in enumerate(di.top_reward_means)
+                            b = i <= length(di.top_oracle_beliefs) ? di.top_oracle_beliefs[i][2] : 0.0
+                            push!(top_parts, "$(a)=μ$(round(μ, digits=2)),b$(round(b, digits=2))")
+                        end
+                        push!(parts, "top:" * join(top_parts, " | "))
+                    end
+                    if !isempty(parts)
+                        di_str = " {" * join(parts, ", ") * "}"
+                    end
+                end
+                print(@sprintf("  %3d. %-30s%s%s%s\n", step, action, r_str, sq, di_str))
                 flush(stdout)
             end
             done && break

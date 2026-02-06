@@ -74,9 +74,10 @@ Fields:
 - model::FactoredWorldModel       # Reference to the model
 - sampled_cpds::Dict              # sampled_cpds[action][var] = θ (sampled parameters)
 """
-struct SampledFactoredDynamics
+mutable struct SampledFactoredDynamics
     model::FactoredWorldModel
     sampled_cpds::Dict{String, Dict{String, Vector{Float64}}}
+    sampled_rewards::Dict{Tuple{Any,String}, Float64}
 end
 
 """
@@ -210,7 +211,16 @@ function BayesianAgents.sample_dynamics(model::FactoredWorldModel)
         end
     end
 
-    return SampledFactoredDynamics(model, sampled_cpds)
+    # Sample rewards from Normal-Gamma posteriors (matching TabularWorldModel)
+    sampled_rewards = Dict{Tuple{Any,String}, Float64}()
+    for (key, p) in model.reward_posterior
+        # Sample σ² ~ InvGamma(α, β), then r ~ Normal(μ, √(σ²/κ))
+        σ² = rand(Distributions.InverseGamma(p.α, p.β))
+        r = rand(Distributions.Normal(p.μ, sqrt(σ² / p.κ)))
+        sampled_rewards[key] = r
+    end
+
+    return SampledFactoredDynamics(model, sampled_cpds, sampled_rewards)
 end
 
 """
@@ -271,23 +281,19 @@ Get expected reward for state-action pair under sampled model.
 Interface matches TabularWorldModel for MCTS compatibility.
 """
 function get_reward(sampled::SampledFactoredDynamics, s::MinimalState, a::String)::Float64
-    model = sampled.model
     key = (s, a)
 
-    # Check if confirmed self-loop (no learning needed)
-    if (observable_key(s), a) ∈ model.confirmed_selfloops
-        return 0.0
+    # Return Thompson-sampled reward if available
+    if haskey(sampled.sampled_rewards, key)
+        return sampled.sampled_rewards[key]
     end
 
-    # Return posterior mean reward
-    if haskey(model.reward_posterior, key)
-        posterior = model.reward_posterior[key]
-        # Normal-Gamma posterior: mean = μ
-        return posterior.μ
-    end
-
-    # No data for this state-action: return neutral estimate
-    return 0.0
+    # No data for this state-action: lazily sample from prior and cache
+    p = sampled.model.reward_prior
+    σ² = rand(Distributions.InverseGamma(p.α, p.β))
+    r = rand(Distributions.Normal(p.μ, sqrt(σ² / p.κ)))
+    sampled.sampled_rewards[key] = r
+    return r
 end
 
 """
