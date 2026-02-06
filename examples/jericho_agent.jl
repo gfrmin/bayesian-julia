@@ -155,7 +155,9 @@ function run_jericho_experiment(;
 
     # Stage 1: MVBN with factored state representation
     # Learns P(location' | location, action) and P(obj' | obj, action)
-    model = FactoredWorldModel(0.1)  # Dirichlet concentration prior
+    model = FactoredWorldModel(0.1;
+                              reward_prior_mean=0.0,
+                              reward_prior_variance=1.0)
 
     # Create planner
     planner = ThompsonMCTS(

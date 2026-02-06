@@ -465,6 +465,7 @@ function build_llm_context(agent::BayesianAgent)
     # Globally effective actions: (state, action) pairs with positive average reward anywhere
     globally_effective = String[]
     for (key, p) in agent.model.reward_posterior
+        # κ represents effective observations in the posterior
         n_obs = Int(p.κ - agent.model.reward_prior.κ)
         if n_obs > 0 && p.μ > 0.1  # Saw positive rewards
             action_name = key[2]
@@ -485,6 +486,7 @@ function build_llm_context(agent::BayesianAgent)
     tried = String[]
     for (key, p) in agent.model.reward_posterior
         if key[1] == s
+            # κ represents effective observations in the posterior
             n_obs = Int(p.κ - agent.model.reward_prior.κ)
             if n_obs > 0
                 avg_r = round(p.μ, digits=2)

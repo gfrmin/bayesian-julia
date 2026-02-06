@@ -38,19 +38,26 @@ mutable struct FactoredWorldModel <: WorldModel
     # Dynamics prior: concentration for Dirichlet
     dynamics_prior_strength::Float64
 
-    # Reward model: (state, action) → Normal-Gamma posterior
+    # Reward model prior: Normal-Gamma prior for unseen (state, action) pairs
+    reward_prior::NormalGammaPosterior
+
+    # Reward model posterior: (state, action) → Normal-Gamma posterior
     reward_posterior::Dict{Tuple{Any,String}, NormalGammaPosterior}
 
     # Confirmed self-loops: (state, action) where outcome is always unchanged
     confirmed_selfloops::Set{Tuple{Any,String}}
 
-    function FactoredWorldModel(prior_strength::Float64=0.1)
+    function FactoredWorldModel(prior_strength::Float64=0.1;
+                               reward_prior_mean::Float64=0.0,
+                               reward_prior_variance::Float64=1.0)
+        prior = NormalGammaPosterior(1.0, reward_prior_mean, 1.0, reward_prior_variance)
         new(
             Dict{String, Dict{String, DirichletCategorical}}(),
             Dict{Tuple{Any,String}, Vector{Any}}(),
             Set{String}(),
             Set{String}(),
             prior_strength,
+            prior,
             Dict{Tuple{Any,String}, NormalGammaPosterior}(),
             Set{Tuple{Any,String}}()
         )
