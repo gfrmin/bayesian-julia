@@ -89,6 +89,27 @@ using Downloads
 using JSON
 
 """
+    get_available_ollama_models(; base_url) → Vector{String}
+
+Query the Ollama /api/tags endpoint to list installed models.
+Returns empty vector if Ollama is not running or unreachable.
+"""
+function get_available_ollama_models(; base_url::String = "http://localhost:11434")
+    try
+        io = IOBuffer()
+        Downloads.request("$base_url/api/tags";
+            method = "GET",
+            output = io,
+            timeout = 5)
+        data = JSON.parse(String(take!(io)))
+        models = get(data, "models", [])
+        return String[get(m, "name", "") for m in models if !isempty(get(m, "name", ""))]
+    catch
+        return String[]
+    end
+end
+
+"""
     make_ollama_client(; base_url, model, temperature, timeout)
 
 Create a named tuple with a `query` function that calls the local Ollama
@@ -136,7 +157,7 @@ function run_jericho_experiment(;
     max_steps::Int = 50,
     ollama_model::String = "llama3.2",
     mcts_iterations::Int = 60,
-    mcts_depth::Int = 8,
+    mcts_depth::Int = 12,
     verbose::Bool = true
 )
     println("=" ^ 60)
@@ -173,26 +194,55 @@ function run_jericho_experiment(;
     # Create sensors (auto-detect LLM availability)
     sensors = Sensor[]
     try
-        println("Attempting LLM sensor connection ($ollama_model)...")
-        client = make_ollama_client(model=ollama_model, timeout=60)
-        # Test connection
-        test_response = client.query("Say 'ok'.")
-        if !isempty(test_response)
-            println("✓ Ollama connected: $(strip(test_response))")
-            # Skeptical prior: Beta(2,1) for TPR (prefer true positives),
-            # Beta(1,2) for FPR (prefer true negatives)
-            sensor = LLMSensor("llm", client;
-                prompt_template = "{question}",
-                tp_prior = (2.0, 1.0),
-                fp_prior = (1.0, 2.0))
-            push!(sensors, sensor)
+        println("Detecting Ollama models...")
+        available_models = get_available_ollama_models()
+        if isempty(available_models)
+            println("⊘ Ollama not responding on localhost:11434")
+            println("  To enable: ollama serve && ollama pull llama3.2")
         else
-            println("⊘ Ollama not responding — proceeding without LLM sensor")
-            println("  (To enable: ollama serve && ollama pull $ollama_model)")
+            println("  Available models: $(join(available_models, ", "))")
+
+            # Try requested model first, then fall back to whatever is available
+            # Strip :latest suffix for matching since Ollama returns "model:latest"
+            normalize_model(m) = replace(m, r":latest$" => "")
+            candidates = vcat(
+                [ollama_model],
+                sort(available_models, by=m -> normalize_model(m) == ollama_model ? 0 : 1)
+            )
+            seen = Set{String}()
+
+            connected = false
+            for model_name in candidates
+                norm = normalize_model(model_name)
+                norm ∈ seen && continue
+                push!(seen, norm)
+
+                try
+                    client = make_ollama_client(model=model_name, timeout=60)
+                    test_response = client.query("Say 'ok'.")
+                    if !isempty(test_response)
+                        println("✓ Ollama connected with model: $model_name")
+                        sensor = LLMSensor("llm", client;
+                            prompt_template = "{question}",
+                            tp_prior = (2.0, 1.0),
+                            fp_prior = (1.0, 2.0))
+                        push!(sensors, sensor)
+                        connected = true
+                        break
+                    end
+                catch e
+                    println("  ✗ Model $model_name failed: $(sprint(showerror, e))")
+                end
+            end
+
+            if !connected
+                println("⊘ No Ollama models responded — proceeding without LLM sensor")
+                println("  Models found but not working: $(join(available_models, ", "))")
+            end
         end
     catch e
         println("⊘ LLM sensor unavailable — proceeding without it")
-        println("  Error: $(typeof(e).__name__)")
+        println("  Error: $(sprint(showerror, e))")
     end
     println()
 
@@ -320,7 +370,7 @@ function parse_args(args)
     ollama_model = "llama3.2"
     verbose = true
     mcts_iterations = 60
-    mcts_depth = 8
+    mcts_depth = 12
 
     i = 1
     while i <= length(args)

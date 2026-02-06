@@ -524,12 +524,6 @@ function act!(agent::BayesianAgent)
     s = agent.current_abstract_state
     available_actions = actions(agent.world, agent.current_observation)
 
-    # Filter out confirmed self-loops if there are alternatives
-    viable_actions = filter(a -> !is_selfloop(agent.model, s, a), available_actions)
-    if !isempty(viable_actions)
-        available_actions = viable_actions
-    end
-
     # VOI-gated sensor queries
     # Maintain per-action belief P(action helps) — prior is 1/N (most actions don't help)
     n_actions = length(available_actions)
@@ -664,6 +658,9 @@ function act!(agent::BayesianAgent)
 
     # ================================================================
     # PHASE 2: HIDDEN VARIABLE INFERENCE (if LLM sensor available)
+    # Run BEFORE null-outcome detection so hidden variable changes
+    # prevent false self-loop marking (e.g. "open box" changes
+    # object_states even when observation text looks identical).
     # ================================================================
     if !isempty(agent.sensors)
         llm_idx = findfirst(s -> s isa LLMSensor, agent.sensors)
@@ -676,6 +673,22 @@ function act!(agent::BayesianAgent)
                 @debug "Hidden variable inference failed" error=e
             end
         end
+    end
+
+    # Also infer hidden variables from text heuristics (no LLM needed)
+    if s′ isa MinimalState
+        obs_text = extract_observation_text(obs)
+        infer_hidden_variables_heuristic!(s′, obs_text)
+    end
+
+    # Null-outcome detection: compare RICH states (including hidden variables)
+    # instead of just observation text. This prevents false positives where
+    # the text looks the same but hidden state has changed.
+    state_unchanged = (s isa MinimalState && s′ isa MinimalState) ? (s == s′) : is_null_outcome(agent.current_observation, obs)
+    if state_unchanged && reward == 0.0
+        resolve_null_action_queries!(agent, action)
+        mark_selfloop!(agent.model, s, action)
+        agent.action_belief_cache[(s, action)] = 0.001
     end
 
     # Update model
@@ -739,17 +752,10 @@ function act!(agent::BayesianAgent)
     if !isnothing(contradiction)
         refine!(agent.abstractor, contradiction)
     end
-    
+
     # Store sensor queries for delayed credit assignment
     for (sensor, queried_action, said_yes) in sensor_queries
         push!(agent.pending_sensor_queries, (sensor, queried_action, said_yes, agent.step_count))
-    end
-
-    # Null-action ground truth: if observation text unchanged, action was unhelpful
-    if is_null_outcome(agent.current_observation, obs)
-        resolve_null_action_queries!(agent, action)
-        mark_selfloop!(agent.model, s, action)
-        agent.action_belief_cache[(s, action)] = 0.001
     end
 
     # When reward != 0, resolve pending queries with discounted trajectory credit
@@ -916,7 +922,7 @@ export VariableCandidate, extract_candidate_variables, compute_bic, compute_bic_
 export should_accept_variable, discover_variables!, update_state_belief_with_discovery!
 
 # Hidden variable inference (Phase 2)
-export infer_hidden_variables!, extract_spell_name, extract_object_states, extract_knowledge
+export infer_hidden_variables!, infer_hidden_variables_heuristic!, extract_spell_name, extract_object_states, extract_knowledge
 
 # Stage 3: Structure Learning exports
 export DirectedGraph, add_edge!, remove_edge!, get_parents, is_acyclic

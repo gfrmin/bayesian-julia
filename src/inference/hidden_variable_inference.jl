@@ -83,7 +83,7 @@ Attempt to extract spell name from observation text.
 E.g., "You feel the power of detect magic" → "detect_magic"
 """
 function extract_spell_name(text::String)::String
-    # Simple heuristic: look for common spell keywords
+    # Look for common spell keywords in IF games (especially Enchanter/Zork)
     spell_keywords = [
         ("detect magic" => "detect_magic"),
         ("detect_magic" => "detect_magic"),
@@ -93,6 +93,21 @@ function extract_spell_name(text::String)::String
         ("invisibility" => "invisibility"),
         ("teleport" => "teleport"),
         ("summon" => "summon"),
+        ("nitfol" => "nitfol"),
+        ("frotz" => "frotz"),
+        ("gnusto" => "gnusto"),
+        ("rezrov" => "rezrov"),
+        ("krebf" => "krebf"),
+        ("zifmia" => "zifmia"),
+        ("cleesh" => "cleesh"),
+        ("malyon" => "malyon"),
+        ("exex" => "exex"),
+        ("kulcad" => "kulcad"),
+        ("ozmoo" => "ozmoo"),
+        ("gondar" => "gondar"),
+        ("vaxum" => "vaxum"),
+        ("gaspar" => "gaspar"),
+        ("melbor" => "melbor"),
     ]
 
     text_lower = lowercase(text)
@@ -124,12 +139,21 @@ function extract_object_states(text::String)::Dict{String, String}
         states["torch"] = "lit"
     end
 
-    # Lock states
+    # Lock/open states
     if contains(text_lower, "door") && (contains(text_lower, "unlock") || contains(text_lower, "open"))
         states["door"] = "unlocked"
     end
     if contains(text_lower, "chest") && (contains(text_lower, "unlock") || contains(text_lower, "open"))
-        states["chest"] = "unlocked"
+        states["chest"] = "open"
+    end
+    if contains(text_lower, "box") && (contains(text_lower, "open") || contains(text_lower, "reveal"))
+        states["box"] = "open"
+    end
+    if contains(text_lower, "case") && (contains(text_lower, "open") || contains(text_lower, "reveal"))
+        states["case"] = "open"
+    end
+    if contains(text_lower, "lid") && (contains(text_lower, "open") || contains(text_lower, "lift") || contains(text_lower, "remove"))
+        states["container"] = "open"
     end
 
     # Activation states
@@ -138,6 +162,17 @@ function extract_object_states(text::String)::Dict{String, String}
     end
     if contains(text_lower, "bridge") && contains(text_lower, "appear")
         states["bridge"] = "visible"
+    end
+    if contains(text_lower, "gate") && (contains(text_lower, "open") || contains(text_lower, "raise"))
+        states["gate"] = "open"
+    end
+
+    # Enchanter-specific: scroll reading / spell book
+    if contains(text_lower, "scroll") && (contains(text_lower, "read") || contains(text_lower, "crumble") || contains(text_lower, "vanish"))
+        states["scroll"] = "read"
+    end
+    if contains(text_lower, "spell book") || contains(text_lower, "spellbook")
+        states["spellbook"] = "consulted"
     end
 
     return states
@@ -173,4 +208,25 @@ function extract_knowledge(text::String)::Set{String}
     return knowledge
 end
 
-export infer_hidden_variables!, extract_spell_name, extract_object_states, extract_knowledge
+"""
+    infer_hidden_variables_heuristic!(state::MinimalState, observation_text::String)
+
+Lightweight hidden variable inference using text heuristics only (no LLM needed).
+Extracts spell names, object state changes, and knowledge from observation text patterns.
+"""
+function infer_hidden_variables_heuristic!(state::MinimalState, observation_text::String)
+    spell = extract_spell_name(observation_text)
+    if !isempty(spell)
+        push!(state.spells_known, spell)
+    end
+
+    obj_states = extract_object_states(observation_text)
+    merge!(state.object_states, obj_states)
+
+    facts = extract_knowledge(observation_text)
+    union!(state.knowledge_gained, facts)
+
+    return state
+end
+
+export infer_hidden_variables!, infer_hidden_variables_heuristic!, extract_spell_name, extract_object_states, extract_knowledge
