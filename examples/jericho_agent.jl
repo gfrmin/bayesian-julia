@@ -1,22 +1,28 @@
 """
-    Bayesian Agent Example: Interactive Fiction via Jericho
+    Unified Bayesian Agent: Interactive Fiction via Jericho
 
-This example demonstrates the **5-stage Bayesian framework** on IF games:
-1. **Stage 1: MVBN** ✓ - MinimalState (location, inventory) with FactoredWorldModel (ACTIVE)
-2. **Stage 2: Variable Discovery** - Auto-discover state variables from text (coming soon)
-3. **Stage 3: Structure Learning** - Learn causal dependencies (Bayesian networks) (coming soon)
-4. **Stage 4: Action Schemas** - Generalize across action instances (coming soon)
-5. **Stage 5: Goal Planning** - Extract objectives, plan toward goals (coming soon)
+A world-agnostic Bayesian agent that maximizes expected utility using all available
+mechanisms:
 
-Stage 1 implements factored state representation with Dirichlet-Categorical dynamics learning.
-All learning via Bayesian inference. No heuristics.
+- **Factored State Representation**: MinimalState (location, inventory, hidden variables)
+- **Dirichlet-Categorical Dynamics**: Learns P(state'|state, action) incrementally
+- **Thompson Sampling MCTS**: Plans ahead with posterior-sampled dynamics
+- **Hidden Variable Inference**: If LLM available, infers spell knowledge, object states
+- **Variable Discovery**: Auto-discovers new state variables via BIC model selection
+- **Structure Learning**: Learns causal dependencies (action scopes)
+- **Action Schemas**: Generalizes across action instances
+- **Goal Planning**: Extracts and tracks objectives from observation text
+
+All mechanisms run unconditionally. No toggle flags. Just one agent, any world.
 
 Requirements:
     pip install jericho
-    ollama serve && ollama pull llama3.1
+
+Optional (for LLM sensor):
+    ollama serve && ollama pull llama3.2
 
 Run with:
-    julia --project=. examples/jericho_agent.jl path/to/enchanter.z3 --llm --model llama3.1 --episodes 3 --steps 150
+    julia --project=. examples/jericho_agent.jl path/to/enchanter.z3 --episodes 5 --steps 150
 """
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
@@ -128,24 +134,17 @@ function run_jericho_experiment(;
     game_path::String,
     n_episodes::Int = 5,
     max_steps::Int = 50,
-    use_llm::Bool = false,
-    force_llm::Bool = false,
     ollama_model::String = "llama3.2",
     mcts_iterations::Int = 60,
     mcts_depth::Int = 8,
-    verbose::Bool = true,
-    enable_stage2::Bool = false,
-    enable_stage3::Bool = false,
-    enable_stage4::Bool = false,
-    enable_stage5::Bool = false
+    verbose::Bool = true
 )
     println("=" ^ 60)
-    println("BAYESIAN IF AGENT")
+    println("UNIFIED BAYESIAN AGENT - Interactive Fiction")
     println("=" ^ 60)
     println("Game:     $(basename(game_path))")
     println("Episodes: $n_episodes")
     println("Steps:    $max_steps per episode")
-    println("LLM:      $(use_llm ? ollama_model : "disabled")")
     println("MCTS:     $(mcts_iterations) iterations, depth $(mcts_depth)")
     println()
 
@@ -169,32 +168,33 @@ function run_jericho_experiment(;
     # Stage 1: Factored state extraction (location, inventory)
     abstractor = MinimalStateAbstractor()
 
-    # Create sensors
+    # Create sensors (auto-detect LLM availability)
     sensors = Sensor[]
-    if use_llm
-        println("Connecting to Ollama ($ollama_model)...")
+    try
+        println("Attempting LLM sensor connection ($ollama_model)...")
         client = make_ollama_client(model=ollama_model, timeout=60)
         # Test connection
         test_response = client.query("Say 'ok'.")
-        if isempty(test_response)
-            if force_llm
-                error("Ollama not responding and --force-llm specified. Start Ollama with: ollama serve")
-            else
-                @warn "Ollama not responding — continuing without LLM sensor"
-            end
-        else
-            println("Ollama connected: $(strip(test_response))")
-            # Skeptical prior: uniform Beta(1,1) for both TPR and FPR.
+        if !isempty(test_response)
+            println("✓ Ollama connected: $(strip(test_response))")
+            # Skeptical prior: Beta(2,1) for TPR (prefer true positives),
+            # Beta(1,2) for FPR (prefer true negatives)
             sensor = LLMSensor("llm", client;
                 prompt_template = "{question}",
                 tp_prior = (2.0, 1.0),
                 fp_prior = (1.0, 2.0))
             push!(sensors, sensor)
+        else
+            println("⊘ Ollama not responding — proceeding without LLM sensor")
+            println("  (To enable: ollama serve && ollama pull $ollama_model)")
         end
-        println()
+    catch e
+        println("⊘ LLM sensor unavailable — proceeding without it")
+        println("  Error: $(typeof(e).__name__)")
     end
+    println()
 
-    # Create agent
+    # Create agent with unified Bayesian framework
     agent = BayesianAgent(
         world, model, planner, abstractor;
         sensors = sensors,
@@ -203,14 +203,11 @@ function run_jericho_experiment(;
             mcts_iterations = mcts_iterations,
             sensor_cost = 0.01,
             max_queries_per_step = 3,
-            enable_variable_discovery = enable_stage2,
             variable_discovery_frequency = 20,
             variable_bic_threshold = 0.0,
-            enable_structure_learning = enable_stage3,
             structure_learning_frequency = 50,
-            enable_action_schemas = enable_stage4,
             schema_discovery_frequency = 100,
-            enable_goal_planning = enable_stage5
+            goal_rollout_bias = 0.5
         )
     )
 
@@ -318,16 +315,10 @@ function parse_args(args)
     game_path = nothing
     n_episodes = 5
     max_steps = 50
-    use_llm = false
-    force_llm = false
     ollama_model = "llama3.2"
     verbose = true
     mcts_iterations = 60
     mcts_depth = 8
-    enable_stage2 = false
-    enable_stage3 = false
-    enable_stage4 = false
-    enable_stage5 = false
 
     i = 1
     while i <= length(args)
@@ -358,19 +349,6 @@ function parse_args(args)
             verbose = true
         elseif arg == "--debug"
             ENV["JULIA_DEBUG"] = "Main.BayesianAgents"
-        elseif arg == "--stage2"
-            enable_stage2 = true
-        elseif arg == "--stage3"
-            enable_stage3 = true
-        elseif arg == "--stage4"
-            enable_stage4 = true
-        elseif arg == "--stage5"
-            enable_stage5 = true
-        elseif arg == "--all-stages"
-            enable_stage2 = true
-            enable_stage3 = true
-            enable_stage4 = true
-            enable_stage5 = true
         elseif !startswith(arg, "-") && isnothing(game_path)
             game_path = arg
         else
@@ -394,7 +372,7 @@ function parse_args(args)
         end
         if isnothing(game_path)
             error("""No game file specified. Usage:
-  julia --project=. examples/jericho_agent.jl path/to/game.z5 [--episodes N] [--steps N] [--llm] [--model NAME] [--quiet]""")
+  julia --project=. examples/jericho_agent.jl path/to/game.z5 [--episodes N] [--steps N] [--model NAME] [--quiet]""")
         end
     end
 
@@ -406,16 +384,10 @@ function parse_args(args)
         game_path = game_path,
         n_episodes = n_episodes,
         max_steps = max_steps,
-        use_llm = use_llm,
-        force_llm = force_llm,
         ollama_model = ollama_model,
         verbose = verbose,
         mcts_iterations = mcts_iterations,
         mcts_depth = mcts_depth,
-        enable_stage2 = enable_stage2,
-        enable_stage3 = enable_stage3,
-        enable_stage4 = enable_stage4,
-        enable_stage5 = enable_stage5
     )
 end
 
@@ -425,15 +397,9 @@ if abspath(PROGRAM_FILE) == @__FILE__
         game_path = opts.game_path,
         n_episodes = opts.n_episodes,
         max_steps = opts.max_steps,
-        use_llm = opts.use_llm,
-        force_llm = opts.force_llm,
         ollama_model = opts.ollama_model,
         verbose = opts.verbose,
         mcts_iterations = opts.mcts_iterations,
-        mcts_depth = opts.mcts_depth,
-        enable_stage2 = opts.enable_stage2,
-        enable_stage3 = opts.enable_stage3,
-        enable_stage4 = opts.enable_stage4,
-        enable_stage5 = opts.enable_stage5
+        mcts_depth = opts.mcts_depth
     )
 end

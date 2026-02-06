@@ -290,40 +290,31 @@ Base.@kwdef struct AgentConfig
     mcts_iterations::Int = 100
     discount::Float64 = 0.99
     ucb_c::Float64 = 2.0
-    
+
     # Sensors
     sensor_cost::Float64 = 0.01
     max_queries_per_step::Int = 10
-    
+
     # Priors
     transition_prior_strength::Float64 = 0.1
     reward_prior_mean::Float64 = 0.0
     reward_prior_variance::Float64 = 1.0
-    
+
     # State abstraction
     abstraction_threshold::Float64 = 0.95
-    
+
     # Intrinsic motivation
     use_intrinsic_reward::Bool = true
     intrinsic_scale::Float64 = 0.1
 
-    # Stage 2: Variable Discovery
-    enable_variable_discovery::Bool = false
-    variable_discovery_frequency::Int = 10  # Every N steps
-    variable_bic_threshold::Float64 = 0.0   # BIC improvement threshold
-
-    # Stage 3: Structure Learning
-    enable_structure_learning::Bool = false
-    structure_learning_frequency::Int = 50  # Every N transitions
-    max_parents::Int = 3
-
-    # Stage 4: Action Schemas
-    enable_action_schemas::Bool = false
-    schema_discovery_frequency::Int = 100   # Every N transitions
-
-    # Stage 5: Goal Planning
-    enable_goal_planning::Bool = false
-    goal_rollout_bias::Float64 = 0.5       # Blend: (1-bias)*random + bias*goal-directed
+    # Learning mechanism frequencies (computational efficiency tuning)
+    # All mechanisms run unconditionally; these control HOW OFTEN
+    variable_discovery_frequency::Int = 10      # Run every N steps
+    variable_bic_threshold::Float64 = 0.0       # BIC improvement threshold for new variables
+    structure_learning_frequency::Int = 50      # Run every N transitions
+    max_parents::Int = 3                        # Max parents in learned causal structure
+    schema_discovery_frequency::Int = 100       # Run every N transitions
+    goal_rollout_bias::Float64 = 0.5           # Blend: (1-bias)*random + bias*goal-directed
 end
 
 # ============================================================================
@@ -692,61 +683,54 @@ function act!(agent::BayesianAgent)
     record_transition!(agent.abstractor, s, action, reward, s′)
 
     # ================================================================
-    # STAGES 2-5: ADVANCED LEARNING (Optional, config-gated)
+    # UNIFIED LEARNING MECHANISMS (No toggles - all run at configured frequency)
     # ================================================================
-    # Note: These features are available and tested, but require different
-    # state representations in some cases. For now, we demonstrate Stage 5
-    # (goal planning) which works directly with MinimalState.
+    # The agent uses ALL available mechanisms to maximize expected utility.
+    # These are gated by computational frequency only, not by enable flags.
 
-    # Stage 3: Structure Learning (action scope identification)
-    if agent.config.enable_structure_learning && agent.step_count % agent.config.structure_learning_frequency == 0
+    # Structure Learning: Action scope identification (periodic)
+    if agent.step_count % agent.config.structure_learning_frequency == 0
         try
             if isa(agent.model, FactoredWorldModel)
                 scope = compute_action_scope(agent.model, action)
                 if !isempty(scope)
-                    @debug "Stage 3: Action Scope" action scope=scope
+                    @debug "Structure Learning: Action Scope" action scope=scope
                 end
             end
         catch e
-            @debug "Stage 3 error" exception=e
+            @debug "Structure Learning error" exception=e
         end
     end
 
-    # Stage 4: Action Schemas (clustering similar actions)
-    if agent.config.enable_action_schemas && agent.step_count % agent.config.schema_discovery_frequency == 0
+    # Action Schemas: Clustering similar actions (periodic)
+    if agent.step_count % agent.config.schema_discovery_frequency == 0
         try
             if isa(agent.model, FactoredWorldModel)
                 schemas = discover_schemas(agent.model)
                 if !isempty(schemas)
-                    @debug "Stage 4: Action Schemas discovered" num_schemas=length(schemas)
+                    @debug "Action Schemas discovered" num_schemas=length(schemas)
                 end
             end
         catch e
-            @debug "Stage 4 error" exception=e
+            @debug "Schema discovery error" exception=e
         end
     end
 
-    # Stage 5: Goal-Directed Planning (extract and track goals from observation text)
-    if agent.config.enable_goal_planning
-        try
-            obs_text = extract_observation_text(obs)
-            goals = extract_goals_from_text(obs_text)
-            if !isempty(goals)
-                # Update goal achievement status based on current state
-                if isa(s′, MinimalState)
-                    update_goal_status!(goals, s′)
-                    achieved_count = count(g -> g.achieved for g in goals)
-                    @debug "Stage 5: Goal Planning" num_goals=length(goals) achieved=achieved_count
-                end
+    # Goal Planning: Extract and track goals from observation text
+    try
+        obs_text = extract_observation_text(obs)
+        goals = extract_goals_from_text(obs_text)
+        if !isempty(goals)
+            # Update goal achievement status based on current state
+            if isa(s′, MinimalState)
+                update_goal_status!(goals, s′)
+                achieved_count = count(g -> g.achieved for g in goals)
+                @debug "Goal Planning" num_goals=length(goals) achieved=achieved_count
             end
-        catch e
-            @debug "Stage 5 error" exception=e
         end
+    catch e
+        @debug "Goal planning error" exception=e
     end
-
-    # ================================================================
-    # END STAGES 2-5
-    # ================================================================
 
     # Check for contradictions and refine if needed
     contradiction = check_contradiction(agent.abstractor)
