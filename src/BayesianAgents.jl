@@ -359,6 +359,10 @@ mutable struct BayesianAgent{W<:World, M<:WorldModel, P<:Planner, A<:StateAbstra
 
     # State analysis cache: observation_hash → StateAnalysis
     state_analysis_cache::Dict{UInt64, Any}
+
+    # Tracks actions boosted by state analysis (for ground truth learning)
+    # Maps step → Set of actions that analysis marked as promising
+    analysis_boosted_actions::Dict{Int, Set{Any}}
 end
 
 """
@@ -382,7 +386,8 @@ function BayesianAgent(
         Tuple{Sensor, Any, Bool, Int}[],
         0,
         Tuple{Any, String}[],
-        Dict{UInt64, Any}()
+        Dict{UInt64, Any}(),
+        Dict{Int, Set{Any}}()
     )
 end
 
@@ -402,6 +407,7 @@ function reset!(agent::BayesianAgent)
     agent.last_reward_step = 0
     empty!(agent.observation_history)
     empty!(agent.state_analysis_cache)
+    empty!(agent.analysis_boosted_actions)
     return agent.current_observation
 end
 
@@ -486,7 +492,9 @@ function build_llm_context(agent::BayesianAgent)
     # World model knowledge: what actions have been tried from this state
     tried = String[]
     for (key, p) in agent.model.reward_posterior
-        if key[1] == s
+        state_match = (s isa MinimalState && key[1] isa MinimalState) ?
+            (observable_key(key[1]) == observable_key(s)) : (key[1] == s)
+        if state_match
             # κ represents effective observations in the posterior
             n_obs = Int(p.κ - agent.model.reward_prior.κ)
             if n_obs > 0
@@ -562,13 +570,16 @@ function act!(agent::BayesianAgent)
     end
 
     # Query state analysis from LLM if beliefs are uncertain
+    analysis_applied = false
     for sensor in agent.sensors
         sensor isa LLMSensor || continue
 
         obs_hash = hash(extract_observation_text(agent.current_observation))
+        local current_analysis
         if haskey(agent.state_analysis_cache, obs_hash)
             current_analysis = agent.state_analysis_cache[obs_hash]
             apply_state_analysis_priors!(current_analysis, available_actions, action_beliefs, sensor)
+            analysis_applied = true
         else
             # VOI gate: only analyze if beliefs are uncertain
             max_uncertainty = maximum([min(b, 1-b) for b in values(action_beliefs)]; init=0.0)
@@ -577,6 +588,22 @@ function act!(agent::BayesianAgent)
                 current_analysis = query_state_analysis(sensor, context, available_actions)
                 agent.state_analysis_cache[obs_hash] = current_analysis
                 apply_state_analysis_priors!(current_analysis, available_actions, action_beliefs, sensor)
+                analysis_applied = true
+            end
+        end
+
+        # Record which actions analysis boosted (for ground truth learning)
+        if analysis_applied && @isdefined(current_analysis)
+            promising_lower = [lowercase(d) for d in current_analysis.promising_directions]
+            boosted = Set{Any}()
+            for a in available_actions
+                a_lower = lowercase(string(a))
+                if any(d -> occursin(d, a_lower) || occursin(a_lower, d), promising_lower)
+                    push!(boosted, a)
+                end
+            end
+            if !isempty(boosted)
+                agent.analysis_boosted_actions[agent.step_count] = boosted
             end
         end
         break  # Only use state analysis from first LLM sensor
@@ -722,7 +749,8 @@ function act!(agent::BayesianAgent)
     # State unchanged → also a selfloop (location, inventory, hidden vars same).
     # Either signal suffices; this prevents false negatives from heuristic noise.
     text_unchanged = is_null_outcome(agent.current_observation, obs)
-    state_unchanged = (s isa MinimalState && s′ isa MinimalState) ? (s == s′) : text_unchanged
+    state_unchanged = (s isa MinimalState && s′ isa MinimalState) ?
+        (observable_key(s) == observable_key(s′)) : text_unchanged
     if (text_unchanged || state_unchanged) && reward == 0.0
         resolve_null_action_queries!(agent, action)
         mark_selfloop!(agent.model, s, action)
@@ -821,6 +849,23 @@ function act!(agent::BayesianAgent)
     if reward != 0.0
         resolve_pending_queries!(agent, reward)
         agent.last_reward_step = agent.step_count
+
+        # Update analysis accuracy: check if the executed action was boosted
+        # by state analysis within a recent window (last 5 steps)
+        for llm_sensor in agent.sensors
+            llm_sensor isa LLMSensor || continue
+            for step_k in max(0, agent.step_count - 5):agent.step_count
+                if haskey(agent.analysis_boosted_actions, step_k)
+                    boosted = agent.analysis_boosted_actions[step_k]
+                    llm_sensor.analysis_total += 1
+                    if action in boosted
+                        llm_sensor.analysis_correct += 1
+                    end
+                    delete!(agent.analysis_boosted_actions, step_k)
+                end
+            end
+            break
+        end
     end
 
     # Record transition
@@ -844,6 +889,9 @@ Actions close to the reward event get strong credit (γ^1), distant actions get
 weak credit (γ^20). The proposition was "action helps make progress" — temporal
 proximity determines how much credit the action receives. Very distant actions
 (|discounted| < 0.001) are skipped entirely to avoid noise.
+
+For LLMSensor selection queries (said_yes=true means "LLM selected this action"),
+also updates the selection-specific accuracy tracker separately from TPR/FPR.
 """
 function resolve_pending_queries!(agent::BayesianAgent, reward::Float64)
     γ = agent.config.discount
@@ -858,6 +906,16 @@ function resolve_pending_queries!(agent::BayesianAgent, reward::Float64)
             end
             actually_helped = discounted > 0.0
             update_reliability!(sensor, said_yes, actually_helped)
+
+            # Update selection accuracy for LLMSensor selection queries.
+            # said_yes=true means this was the LLM's selected action.
+            if sensor isa LLMSensor && said_yes
+                sensor.selection_total += 1
+                if actually_helped
+                    sensor.selection_correct += 1
+                end
+            end
+
             push!(resolved, i)
             @debug "trajectory credit" action said_yes actually_helped discount=γ^steps_elapsed
         end
@@ -1004,7 +1062,7 @@ export GridWorld, spawn_food!
 export TabularWorldModel, NormalGammaPosterior, SampledDynamics, get_reward, information_gain
 export ThompsonMCTS, MCTSNode, plan_with_priors, select_rollout_action
 export IdentityAbstractor, BisimulationAbstractor, MinimalStateAbstractor, abstraction_summary
-export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome, StateAnalysis, query_state_analysis, parse_state_analysis, apply_state_analysis_priors!
+export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome, StateAnalysis, query_state_analysis, parse_state_analysis, apply_state_analysis_priors!, selection_accuracy, analysis_accuracy
 export extract_observation_text, build_llm_context
 export action_features, collect_posteriors, combine_posteriors
 

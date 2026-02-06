@@ -189,20 +189,30 @@ Wraps an LLM client and converts questions to yes/no queries.
 """
 mutable struct LLMSensor <: Sensor
     name::String
-    
+
     # Reliability tracking (same as BinarySensor)
     tp_α::Float64
     tp_β::Float64
     fp_α::Float64
     fp_β::Float64
-    
+
     # LLM interface
     llm_client::Any  # Duck-typed: must have query(client, prompt) → String
     prompt_template::String
-    
+
     # Statistics
     n_queries::Int
     n_correct::Int
+
+    # Selection query reliability: separate from binary TPR/FPR
+    # Tracks how often the LLM's selected action led to reward
+    selection_correct::Int
+    selection_total::Int
+
+    # State analysis reliability: separate from binary and selection
+    # Tracks how often analysis-boosted actions led to reward
+    analysis_correct::Int
+    analysis_total::Int
 end
 
 """
@@ -223,9 +233,27 @@ function LLMSensor(
         fp_prior[1], fp_prior[2],
         llm_client,
         prompt_template,
-        0, 0
+        0, 0,
+        0, 0,  # selection_correct, selection_total
+        0, 0   # analysis_correct, analysis_total
     )
 end
+
+"""
+    selection_accuracy(sensor::LLMSensor) → Float64
+
+Posterior mean accuracy of the LLM's action selection.
+Beta(1,1) prior (Laplace smoothing) → learns from reward signal.
+"""
+selection_accuracy(s::LLMSensor) = (s.selection_correct + 1) / (s.selection_total + 2)
+
+"""
+    analysis_accuracy(sensor::LLMSensor) → Float64
+
+Posterior mean accuracy of the LLM's state analysis.
+Beta(1,1) prior (Laplace smoothing) → learns from reward signal.
+"""
+analysis_accuracy(s::LLMSensor) = (s.analysis_correct + 1) / (s.analysis_total + 2)
 
 """
     format_observation_for_llm(obs) → String
@@ -407,19 +435,35 @@ end
     apply_state_analysis_priors!(analysis::StateAnalysis, actions, action_beliefs, sensor)
 
 Apply Bayesian update to action beliefs based on state analysis.
-Promising directions increase action beliefs via the sensor's learned reliability.
+Promising directions boost action beliefs using the analysis-specific accuracy
+(separate from binary TPR/FPR and selection accuracy).
+
+The boost treats analysis as a binary observation per action:
+    P(action is best | analysis says promising) ∝ α_analysis × prior
+    P(action is best | analysis says not promising) ∝ (1 - α_analysis) × prior
+where α_analysis is the learned analysis accuracy.
 """
 function apply_state_analysis_priors!(analysis::StateAnalysis, actions, action_beliefs::Dict, sensor)
     promising_lower = [lowercase(d) for d in analysis.promising_directions]
+    α = sensor isa LLMSensor ? analysis_accuracy(sensor) : 0.5
+    Z = 0.0
 
     for a in actions
         a_lower = lowercase(string(a))
-        # Check if action matches any promising direction
         is_promising = any(d -> occursin(d, a_lower) || occursin(a_lower, d), promising_lower)
+        prior = get(action_beliefs, a, 1.0 / length(actions))
 
         if is_promising
-            prior = get(action_beliefs, a, 1.0 / length(actions))
-            action_beliefs[a] = posterior(sensor, prior, true)
+            action_beliefs[a] = prior * α
+        else
+            action_beliefs[a] = prior * (1 - α)
+        end
+        Z += action_beliefs[a]
+    end
+    # Renormalize
+    if Z > 0
+        for a in actions
+            action_beliefs[a] /= Z
         end
     end
 end
@@ -442,7 +486,12 @@ function query_selection(sensor::LLMSensor, context::String, actions)
 
     action_list = join(["  $(i). $(a)" for (i, a) in enumerate(actions)], "\n")
 
-    prompt = """You are advising an agent playing a text adventure game. Based on the situation below, which single action from the list is most likely to make progress toward winning?
+    prompt = """You are advising an agent playing a text adventure game.
+
+The agent needs to make REAL progress toward winning the game. Based on the situation below, which single action from the list is most likely to advance the game?
+
+Avoid actions that have already been tried with no effect (listed in confirmed useless).
+Prefer actions that explore new areas or interact with new objects over re-examining things already seen.
 
 $context
 
@@ -473,18 +522,34 @@ end
 """
     update_beliefs_from_selection!(sensor, actions, selected, action_beliefs) → Dict
 
-Apply Bayesian update from a selection query result.
+Apply Bayesian update from a selection query result using the correct
+Categorical observation model.
 
-The selected action gets a positive observation (posterior with answer=true).
-All non-selected actions get a negative observation (posterior with answer=false).
+The sensor picks action j with accuracy α (learned). For each action i:
+    P(sensor picks j | i is best) = α       if i == j
+    P(sensor picks j | i is best) = (1-α)/(N-1)  if i ≠ j
+
+Then by Bayes' rule:
+    P(i is best | sensor picked j) ∝ P(sensor picked j | i is best) × π_i
 """
 function update_beliefs_from_selection!(sensor, actions, selected, action_beliefs::Dict)
+    α = sensor isa LLMSensor ? selection_accuracy(sensor) : 0.5
+    N = length(actions)
+    Z = 0.0
+
     for a in actions
-        prior = get(action_beliefs, a, 1.0 / length(actions))
+        π = get(action_beliefs, a, 1.0 / N)
         if a == selected
-            action_beliefs[a] = posterior(sensor, prior, true)
+            action_beliefs[a] = π * α
         else
-            action_beliefs[a] = posterior(sensor, prior, false)
+            action_beliefs[a] = π * (1 - α) / max(N - 1, 1)
+        end
+        Z += action_beliefs[a]
+    end
+    # Renormalize
+    if Z > 0
+        for a in actions
+            action_beliefs[a] /= Z
         end
     end
     return action_beliefs

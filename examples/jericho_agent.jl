@@ -22,7 +22,7 @@ Optional (for LLM sensor):
     ollama serve && ollama pull llama3.2
 
 Run with:
-    julia --project=. examples/jericho_agent.jl path/to/enchanter.z3 --episodes 5 --steps 150
+    julia --project=. examples/jericho_agent.jl path/to/enchanter.z3 --episodes 5 --steps 300
 """
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
@@ -154,7 +154,7 @@ end
 function run_jericho_experiment(;
     game_path::String,
     n_episodes::Int = 5,
-    max_steps::Int = 50,
+    max_steps::Int = 300,
     ollama_model::String = "llama3.2",
     mcts_iterations::Int = 60,
     mcts_depth::Int = 12,
@@ -344,6 +344,12 @@ function run_jericho_experiment(;
             println(@sprintf("  Queries: %d", sensor.n_queries))
             println(@sprintf("  TPR:     %.3f", tpr(sensor)))
             println(@sprintf("  FPR:     %.3f", fpr(sensor)))
+            if sensor isa LLMSensor
+                println(@sprintf("  Selection accuracy: %.3f (%d/%d)",
+                    selection_accuracy(sensor), sensor.selection_correct, sensor.selection_total))
+                println(@sprintf("  Analysis accuracy:  %.3f (%d/%d)",
+                    analysis_accuracy(sensor), sensor.analysis_correct, sensor.analysis_total))
+            end
         end
     end
 
@@ -371,7 +377,7 @@ _mean(x) = isempty(x) ? 0.0 : sum(x) / length(x)
 function parse_args(args)
     game_path = nothing
     n_episodes = 5
-    max_steps = 50
+    max_steps = 300
     ollama_model = "llama3.2"
     verbose = true
     mcts_iterations = 60
