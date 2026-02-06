@@ -331,11 +331,6 @@ function parse_args(args)
         elseif arg == "--steps" && i < length(args)
             i += 1
             max_steps = parse(Int, args[i])
-        elseif arg == "--llm"
-            use_llm = true
-        elseif arg == "--force-llm"
-            use_llm = true
-            force_llm = true
         elseif arg == "--model" && i < length(args)
             i += 1
             ollama_model = args[i]
