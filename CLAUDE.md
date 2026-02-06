@@ -30,7 +30,7 @@ Requires: `pip install jericho` (a Python venv at `.venv/` already exists).
     --quiet               # Suppress verbose output
     --debug               # Enable Julia debug logging
 
-Game files: `/home/g/Sync/git/bayesian-agents/bayesian-if-agent/games/`
+Game files: `~/yo/Games/if/jericho-game-suite/`
 Ollama setup: `ollama serve` then `ollama pull llama3.2`
 
 ## Architecture
