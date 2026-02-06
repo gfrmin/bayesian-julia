@@ -9,3 +9,6 @@ __pycache__/
 
 # Julia artifacts
 *.ji
+
+# Serena MCP (local cache/state)
+.serena/
