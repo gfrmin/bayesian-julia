@@ -275,7 +275,7 @@ function get_reward(sampled::SampledFactoredDynamics, s::MinimalState, a::String
     key = (s, a)
 
     # Check if confirmed self-loop (no learning needed)
-    if key ∈ model.confirmed_selfloops
+    if (observable_key(s), a) ∈ model.confirmed_selfloops
         return 0.0
     end
 
@@ -338,21 +338,35 @@ function BayesianAgents.entropy(model::FactoredWorldModel)::Float64
 end
 
 """
+    observable_key(s::MinimalState) → Tuple
+
+Extract observable state (location, sorted inventory) for selfloop keying.
+Hidden variables are excluded because selfloops depend only on game mechanics,
+not on inferred hidden state. This prevents false negatives when the heuristic
+adds varying knowledge_gained across steps.
+"""
+function observable_key(s::MinimalState)
+    return (s.location, sort(collect(s.inventory)))
+end
+
+"""
     mark_selfloop!(model::FactoredWorldModel, s::MinimalState, a::String)
 
 Record that action a in state s produces no observable change (null action).
+Keyed on observable state only (location + inventory) so hidden variable
+differences don't prevent selfloop detection.
 """
 function mark_selfloop!(model::FactoredWorldModel, s::MinimalState, a::String)
-    push!(model.confirmed_selfloops, (s, a))
+    push!(model.confirmed_selfloops, (observable_key(s), a))
 end
 
 """
     is_selfloop(model::FactoredWorldModel, s::MinimalState, a::String) → Bool
 
-Check if action is confirmed to be a self-loop.
+Check if action is confirmed to be a self-loop from this observable state.
 """
 function is_selfloop(model::FactoredWorldModel, s::MinimalState, a::String)::Bool
-    return (s, a) ∈ model.confirmed_selfloops
+    return (observable_key(s), a) ∈ model.confirmed_selfloops
 end
 
-export FactoredWorldModel, SampledFactoredDynamics, add_location!, add_object!, mark_selfloop!, is_selfloop, sample_next_state
+export FactoredWorldModel, SampledFactoredDynamics, add_location!, add_object!, mark_selfloop!, is_selfloop, observable_key, sample_next_state

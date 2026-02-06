@@ -449,8 +449,9 @@ function build_llm_context(agent::BayesianAgent)
 
     # Confirmed useless actions from this state (null outcomes)
     confirmed_useless = String[]
-    for (state, action) in agent.model.confirmed_selfloops
-        if state == s
+    obs_key = (s isa MinimalState) ? observable_key(s) : s
+    for (state_key, action) in agent.model.confirmed_selfloops
+        if state_key == obs_key
             push!(confirmed_useless, "'$action'")
         end
     end
@@ -524,14 +525,28 @@ function act!(agent::BayesianAgent)
     s = agent.current_abstract_state
     available_actions = actions(agent.world, agent.current_observation)
 
+    # Remove confirmed selfloops and oscillations from consideration.
+    # Selfloops: actions that don't change observable state.
+    # Oscillations: actions that return to a recently-visited observable state.
+    # Both are confirmed zero-value transitions, not heuristic loop detection.
+    if isa(agent.model, FactoredWorldModel) && s isa MinimalState
+        viable = filter(a -> !is_selfloop(agent.model, s, a), available_actions)
+        if !isempty(viable)
+            available_actions = viable
+        end
+    end
+
     # VOI-gated sensor queries
     # Maintain per-action belief P(action helps) — prior is 1/N (most actions don't help)
     n_actions = length(available_actions)
     @debug "act! start" state=s n_actions step=agent.step_count
 
     # Load cached beliefs or default to 1/N
+    # Use observable_key for cache lookup so hidden variable changes don't
+    # invalidate cached beliefs (location + inventory is what matters).
+    obs_key = (s isa MinimalState) ? observable_key(s) : s
     action_beliefs = Dict(
-        a => get(agent.action_belief_cache, (s, a), 1.0 / n_actions)
+        a => get(agent.action_belief_cache, (obs_key, a), 1.0 / n_actions)
         for a in available_actions
     )
 
@@ -621,9 +636,20 @@ function act!(agent::BayesianAgent)
         end
     end
 
-    # Persist updated beliefs back to cache
+    # Re-enforce confirmed selfloop beliefs: ground truth (reward=0, state
+    # unchanged) overrides sensor opinions. Without this, the LLM can boost
+    # a confirmed-useless action back to high belief every step.
+    if isa(agent.model, FactoredWorldModel)
+        for a in available_actions
+            if is_selfloop(agent.model, s, a)
+                action_beliefs[a] = 0.001
+            end
+        end
+    end
+
+    # Persist updated beliefs back to cache using observable key
     for (a, belief) in action_beliefs
-        agent.action_belief_cache[(s, a)] = belief
+        agent.action_belief_cache[(obs_key, a)] = belief
     end
 
     # Normalize beliefs as action priors for the planner
@@ -651,6 +677,16 @@ function act!(agent::BayesianAgent)
     # Execute action
     obs, reward, done, info = step!(agent.world, action)
     s′ = abstract_state(agent.abstractor, obs)
+
+    # Persist hidden variables from previous state: knowledge accumulates
+    # across steps. extract_minimal_state() creates empty hidden vars;
+    # we carry forward what was learned, then the heuristic/LLM adds new.
+    if s isa MinimalState && s′ isa MinimalState
+        union!(s′.spells_known, s.spells_known)
+        merge!(s′.object_states, s.object_states)
+        union!(s′.knowledge_gained, s.knowledge_gained)
+    end
+
     @debug "step result" action reward new_state=s′ done
 
     # Store observation text for LLM context history
@@ -681,14 +717,37 @@ function act!(agent::BayesianAgent)
         infer_hidden_variables_heuristic!(s′, obs_text)
     end
 
-    # Null-outcome detection: compare RICH states (including hidden variables)
-    # instead of just observation text. This prevents false positives where
-    # the text looks the same but hidden state has changed.
-    state_unchanged = (s isa MinimalState && s′ isa MinimalState) ? (s == s′) : is_null_outcome(agent.current_observation, obs)
-    if state_unchanged && reward == 0.0
+    # Null-outcome detection: use BOTH text comparison and state comparison.
+    # Text unchanged → definitely a selfloop (same observation produced).
+    # State unchanged → also a selfloop (location, inventory, hidden vars same).
+    # Either signal suffices; this prevents false negatives from heuristic noise.
+    text_unchanged = is_null_outcome(agent.current_observation, obs)
+    state_unchanged = (s isa MinimalState && s′ isa MinimalState) ? (s == s′) : text_unchanged
+    if (text_unchanged || state_unchanged) && reward == 0.0
         resolve_null_action_queries!(agent, action)
         mark_selfloop!(agent.model, s, action)
-        agent.action_belief_cache[(s, action)] = 0.001
+        s_obs_key = (s isa MinimalState) ? observable_key(s) : s
+        agent.action_belief_cache[(s_obs_key, action)] = 0.001
+    end
+
+    # Oscillation detection: if this action returns us to a state visited
+    # 1-3 steps ago with zero reward, mark it as confirmed zero-value.
+    # This is a generalization of selfloop to 2-step cycles (e.g., east↔sw).
+    if reward == 0.0 && s′ isa MinimalState && !isempty(agent.trajectory)
+        obs_key_prime = observable_key(s′)
+        s_obs_key_here = (s isa MinimalState) ? observable_key(s) : s
+        for i in max(1, length(agent.trajectory) - 3):length(agent.trajectory)
+            prev_s = agent.trajectory[i].s
+            if prev_s isa MinimalState && observable_key(prev_s) == obs_key_prime &&
+               obs_key_prime != s_obs_key_here && agent.trajectory[i].r == 0.0
+                # We returned to a recently-visited state: mark this action as
+                # oscillation (zero-value return transition).
+                mark_selfloop!(agent.model, s, action)
+                agent.action_belief_cache[(s_obs_key_here, action)] = 0.001
+                @debug "Oscillation detected" from=s action to=s′ returned_to=prev_s
+                break
+            end
+        end
     end
 
     # Update model
@@ -913,7 +972,7 @@ end
 export DirichletCategorical, update!, predict, entropy, expected_entropy, mode
 export MinimalState, extract_minimal_state
 export StateBelief, add_object!, update_from_state!, sample_state, predict_state, posterior_prob, loglikelihood
-export FactoredWorldModel, SampledFactoredDynamics, add_location!, sample_next_state, mark_selfloop!, is_selfloop
+export FactoredWorldModel, SampledFactoredDynamics, add_location!, sample_next_state, mark_selfloop!, is_selfloop, observable_key
 export FactoredMCTS, FactoredMCTSNode, mcts_search
 export update_location_belief!, update_inventory_belief!, bayesian_update_belief!, predict_from_likelihood
 

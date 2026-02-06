@@ -158,7 +158,8 @@ function run_jericho_experiment(;
     ollama_model::String = "llama3.2",
     mcts_iterations::Int = 60,
     mcts_depth::Int = 12,
-    verbose::Bool = true
+    verbose::Bool = true,
+    use_llm::Bool = true
 )
     println("=" ^ 60)
     println("UNIFIED BAYESIAN AGENT - Interactive Fiction")
@@ -193,6 +194,9 @@ function run_jericho_experiment(;
 
     # Create sensors (auto-detect LLM availability)
     sensors = Sensor[]
+    if !use_llm
+        println("LLM sensor disabled (--no-llm)")
+    else
     try
         println("Detecting Ollama models...")
         available_models = get_available_ollama_models()
@@ -244,6 +248,7 @@ function run_jericho_experiment(;
         println("⊘ LLM sensor unavailable — proceeding without it")
         println("  Error: $(sprint(showerror, e))")
     end
+    end # use_llm
     println()
 
     # Create agent with unified Bayesian framework
@@ -371,11 +376,14 @@ function parse_args(args)
     verbose = true
     mcts_iterations = 60
     mcts_depth = 12
+    use_llm = true
 
     i = 1
     while i <= length(args)
         arg = args[i]
-        if arg == "--episodes" && i < length(args)
+        if arg == "--no-llm"
+            use_llm = false
+        elseif arg == "--episodes" && i < length(args)
             i += 1
             n_episodes = parse(Int, args[i])
         elseif arg == "--steps" && i < length(args)
@@ -435,6 +443,7 @@ function parse_args(args)
         verbose = verbose,
         mcts_iterations = mcts_iterations,
         mcts_depth = mcts_depth,
+        use_llm = use_llm,
     )
 end
 
@@ -447,6 +456,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
         ollama_model = opts.ollama_model,
         verbose = opts.verbose,
         mcts_iterations = opts.mcts_iterations,
-        mcts_depth = opts.mcts_depth
+        mcts_depth = opts.mcts_depth,
+        use_llm = opts.use_llm
     )
 end
