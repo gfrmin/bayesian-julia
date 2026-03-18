@@ -113,10 +113,8 @@ BDe = log P(data | variable, parents) from conjugate analysis
 
 Higher score = better fit.
 """
-function bde_score(variable::String, parents::Vector{String}, transitions::Vector{Tuple}, prior_strength::Float64=0.1)::Float64
-    # Collect counts of (parent_config, variable_value)
-    # This is simplified: real implementation needs proper data structure
-
+function bde_score(variable::String, parents::Vector{String},
+                   transitions::Vector{Tuple}, prior_strength::Float64=0.1)::Float64
     if isempty(transitions)
         return 0.0
     end
@@ -124,30 +122,18 @@ function bde_score(variable::String, parents::Vector{String}, transitions::Vecto
     # Count transitions for this variable
     value_counts = Dict{Any,Int}()
     for (s, s_next) in transitions
-        # Extract variable values
         val_key = nothing  # Simplified: would extract actual value
-
-        if haskey(value_counts, val_key)
-            value_counts[val_key] += 1
-        else
-            value_counts[val_key] = 1
-        end
+        value_counts[val_key] = get(value_counts, val_key, 0) + 1
     end
 
-    # BDe score (simplified computation)
-    # In practice: compute with proper parent configurations
-    alpha = prior_strength
-    score = 0.0
+    # Build DirichletMeasure and compute log marginal via credence
+    k = length(value_counts)
+    domain = collect(keys(value_counts))
+    alpha = fill(prior_strength, k)
+    counts = [value_counts[d] for d in domain]
 
-    total_count = sum(values(value_counts))
-    for (v, count) in value_counts
-        # Dirichlet-multinomial conjugacy
-        score += loggamma(alpha + count) - loggamma(alpha)
-    end
-
-    score += loggamma(alpha * length(value_counts)) - loggamma(alpha * length(value_counts) + total_count)
-
-    return score
+    m = DirichletMeasure(Simplex(k), Finite(domain), alpha)
+    return log_marginal(m, counts)
 end
 
 """
