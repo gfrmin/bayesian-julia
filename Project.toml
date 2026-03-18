@@ -4,6 +4,7 @@ authors = ["Guy"]
 version = "0.1.0"
 
 [deps]
+Credence = "c9a7aa76-dd45-48a9-bafd-1479667d8249"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
@@ -12,6 +13,9 @@ DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 PyCall = "438e738f-606a-5dbb-bf0a-cddfbfd45ab0"
+
+[sources]
+Credence = {path = "../credence"}
 
 [compat]
 julia = "1.9"

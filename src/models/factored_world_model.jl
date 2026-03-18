@@ -13,11 +13,6 @@ different state variables and sharing of statistical strength.
 Parameters are organized as:
   cpds[action][variable] = DirichletCategorical for that variable under that action
 
-Example dynamics learned:
-- "north" from "Kitchen" → location' ∈ {Forest, Garden} with learned probabilities
-- "take book" → book ∈ inventory' with high probability if preconditions met
-- "drop lantern" → lantern ∈ inventory' with high probability of becoming false
-
 This is mathematically equivalent to Dirichlet-Categorical CPDs in a Bayesian network,
 but organized by action for computational efficiency.
 """
@@ -38,11 +33,11 @@ mutable struct FactoredWorldModel <: WorldModel
     # Dynamics prior: concentration for Dirichlet
     dynamics_prior_strength::Float64
 
-    # Reward model prior: Normal-Gamma prior for unseen (state, action) pairs
-    reward_prior::NormalGammaPosterior
+    # Reward model prior: NormalGammaMeasure for unseen (state, action) pairs
+    reward_prior::NormalGammaMeasure
 
-    # Reward model posterior: (state, action) → Normal-Gamma posterior
-    reward_posterior::Dict{Tuple{Any,String}, NormalGammaPosterior}
+    # Reward model posterior: (state, action) → NormalGammaMeasure
+    reward_posterior::Dict{Tuple{Any,String}, NormalGammaMeasure}
 
     # Confirmed self-loops: (state, action) where outcome is always unchanged
     confirmed_selfloops::Set{Tuple{Any,String}}
@@ -50,7 +45,7 @@ mutable struct FactoredWorldModel <: WorldModel
     function FactoredWorldModel(prior_strength::Float64=0.1;
                                reward_prior_mean::Float64=0.0,
                                reward_prior_variance::Float64=1.0)
-        prior = NormalGammaPosterior(1.0, reward_prior_mean, 1.0, reward_prior_variance)
+        prior = NormalGammaMeasure(1.0, reward_prior_mean, 1.0, reward_prior_variance)
         new(
             Dict{String, Dict{String, DirichletCategorical}}(),
             Dict{Tuple{Any,String}, Vector{Any}}(),
@@ -58,7 +53,7 @@ mutable struct FactoredWorldModel <: WorldModel
             Set{String}(),
             prior_strength,
             prior,
-            Dict{Tuple{Any,String}, NormalGammaPosterior}(),
+            Dict{Tuple{Any,String}, NormalGammaMeasure}(),
             Set{Tuple{Any,String}}()
         )
     end
@@ -159,7 +154,6 @@ function BayesianAgents.update!(model::FactoredWorldModel, s::MinimalState, a::S
 
     # Update inventory CPDs for each object
     for obj in model.known_objects
-        was_in = obj ∈ s.inventory
         now_in = obj ∈ s′.inventory
 
         cpd_key = "inventory_$obj"
@@ -175,20 +169,14 @@ function BayesianAgents.update!(model::FactoredWorldModel, s::MinimalState, a::S
     end
     push!(model.transitions[key], s′)
 
-    # Update reward model (Normal-Gamma conjugate update)
+    # Update reward model via credence's condition()
     reward_key = (s, a)
     if !haskey(model.reward_posterior, reward_key)
-        # Initialize with prior: κ=1 (weak), μ=0, α=1, β=1
-        model.reward_posterior[reward_key] = NormalGammaPosterior(1.0, 0.0, 1.0, 1.0)
+        model.reward_posterior[reward_key] = NormalGammaMeasure(1.0, 0.0, 1.0, 1.0)
     end
 
-    # Bayesian update using Normal-Gamma conjugate pair
     p = model.reward_posterior[reward_key]
-    κₙ = p.κ + 1.0
-    μₙ = (p.κ * p.μ + r) / κₙ
-    αₙ = p.α + 0.5
-    βₙ = p.β + p.κ * (r - p.μ)^2 / (2.0 * κₙ)
-    model.reward_posterior[reward_key] = NormalGammaPosterior(κₙ, μₙ, αₙ, βₙ)
+    model.reward_posterior[reward_key] = condition(p, _NORMAL_GAMMA_KERNEL, r)
 end
 
 """
@@ -198,26 +186,25 @@ Sample one concrete dynamics model from the posterior for Thompson Sampling.
 Returns a sampled model that can be queried for P(s' | s, a).
 """
 function BayesianAgents.sample_dynamics(model::FactoredWorldModel)
-    # Sample CPD parameters for each action
+    # Sample CPD parameters for each action via credence's draw(DirichletMeasure)
     sampled_cpds = Dict{String, Dict{String, Vector{Float64}}}()
 
     for (action, cpds_a) in model.cpds
         sampled_cpds[action] = Dict{String, Vector{Float64}}()
 
         for (var, cpd) in cpds_a
-            # Sample θ ~ Posterior (Dirichlet)
-            theta = rand(Distributions.Dirichlet(cpd.alpha + cpd.counts))
+            # Thompson sampling: draw θ from Dirichlet posterior (two draws)
+            # First draw: sample simplex vector θ from DirichletMeasure
+            theta = draw(cpd.measure)
             sampled_cpds[action][var] = theta
         end
     end
 
-    # Sample rewards from Normal-Gamma posteriors (matching TabularWorldModel)
+    # Sample rewards via credence's draw(NormalGammaMeasure)
     sampled_rewards = Dict{Tuple{Any,String}, Float64}()
     for (key, p) in model.reward_posterior
-        # Sample σ² ~ InvGamma(α, β), then r ~ Normal(μ, √(σ²/κ))
-        σ² = rand(Distributions.InverseGamma(p.α, p.β))
-        r = rand(Distributions.Normal(p.μ, sqrt(σ² / p.κ)))
-        sampled_rewards[key] = r
+        μ_s, _ = draw(p)
+        sampled_rewards[key] = μ_s
     end
 
     return SampledFactoredDynamics(model, sampled_cpds, sampled_rewards)
@@ -242,12 +229,21 @@ function sample_next_state(sampled::SampledFactoredDynamics, s::MinimalState, a:
 
     cpds_a_sampled = sampled_cpds[a]
 
-    # Sample location
+    # Sample location from sampled theta
     if haskey(cpds_a_sampled, "location")
         theta_loc = cpds_a_sampled["location"]
         location_domain = model.cpds[a]["location"].domain
-        location_idx = rand(Distributions.Categorical(theta_loc))
-        new_location = location_domain[location_idx]
+        # Weighted sampling from domain using sampled theta
+        r = rand()
+        cumw = 0.0
+        new_location = location_domain[end]
+        for i in eachindex(theta_loc)
+            cumw += theta_loc[i]
+            if r < cumw
+                new_location = location_domain[i]
+                break
+            end
+        end
     else
         new_location = s.location
     end
@@ -288,12 +284,10 @@ function get_reward(sampled::SampledFactoredDynamics, s::MinimalState, a::String
         return sampled.sampled_rewards[key]
     end
 
-    # No data for this state-action: lazily sample from prior and cache
-    p = sampled.model.reward_prior
-    σ² = rand(Distributions.InverseGamma(p.α, p.β))
-    r = rand(Distributions.Normal(p.μ, sqrt(σ² / p.κ)))
-    sampled.sampled_rewards[key] = r
-    return r
+    # No data for this state-action: lazily sample from prior via credence and cache
+    μ_s, _ = draw(sampled.model.reward_prior)
+    sampled.sampled_rewards[key] = μ_s
+    return μ_s
 end
 
 """
@@ -314,9 +308,9 @@ function BayesianAgents.transition_dist(model::FactoredWorldModel, s::MinimalSta
 end
 
 """
-    reward_dist(model::FactoredWorldModel, s::MinimalState, a::String) → Distribution
+    reward_dist(model::FactoredWorldModel, s::MinimalState, a::String)
 
-Return posterior predictive distribution P(r | s, a).
+Return the reward posterior for a (state, action) pair.
 """
 function BayesianAgents.reward_dist(model::FactoredWorldModel, s::MinimalState, a::String)
     key = (s, a)

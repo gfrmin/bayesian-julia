@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.4"
+julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "9159a37ed698e8d11f04c85d73403c3f0d003117"
+project_hash = "6cd8a443dc37470c115ba2392e695cb72d0f349a"
 
 [[deps.AliasTables]]
 deps = ["PtrArrays", "Random"]
@@ -23,7 +23,7 @@ uuid = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 version = "1.11.0"
 
 [[deps.BayesianAgents]]
-deps = ["DataStructures", "Distributions", "JSON", "LinearAlgebra", "Logging", "PyCall", "Random", "StatsBase"]
+deps = ["Credence", "DataStructures", "Distributions", "JSON", "LinearAlgebra", "Logging", "PyCall", "Random", "StatsBase"]
 path = "."
 uuid = "12345678-1234-1234-1234-123456789abc"
 version = "0.1.0"
@@ -48,6 +48,12 @@ deps = ["Downloads", "JSON", "VersionParsing"]
 git-tree-sha1 = "8f06b0cfa4c514c7b9546756dbae91fcfbc92dc9"
 uuid = "8f4d0f93-b110-5947-807f-2305c1781a2d"
 version = "1.10.3"
+
+[[deps.Credence]]
+deps = ["Serialization"]
+path = "../credence"
+uuid = "c9a7aa76-dd45-48a9-bafd-1479667d8249"
+version = "0.1.0"
 
 [[deps.DataAPI]]
 git-tree-sha1 = "abe83f3a2f1b857aac70ef8b269080af17764bbe"

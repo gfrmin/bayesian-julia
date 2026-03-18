@@ -13,6 +13,7 @@ using Random
 using Distributions
 using LinearAlgebra
 using Logging
+using Credence
 
 # ============================================================================
 # CORE ABSTRACT TYPES
@@ -238,6 +239,15 @@ function plan end
 # ============================================================================
 
 """
+    _reward_mean(rd) → Float64
+
+Extract the mean from a reward distribution. Handles both credence's
+NormalGammaMeasure (returns μ) and Distributions.jl types.
+"""
+_reward_mean(rd::NormalGammaMeasure) = Credence.mean(rd)
+_reward_mean(rd) = _reward_mean(rd)
+
+"""
     get_kappa(model::WorldModel, state, action) → Float64
 
 Extract κ (precision / pseudo-observation count) from the reward posterior
@@ -281,7 +291,7 @@ function compute_voi(sensor::Sensor, oracle_beliefs::Dict, obs_key, target_actio
     # EU for each action: reward posterior mean + oracle bonus
     function eu(a)
         rd = reward_dist(model, state, a)
-        μ = Distributions.mean(rd)
+        μ = _reward_mean(rd)
         μ = isfinite(μ) ? μ : 0.0
         belief = get(oracle_beliefs, (obs_key, string(a)), default_belief)
         κ_a = get_kappa(model, state, a)
@@ -348,10 +358,6 @@ Base.@kwdef struct AgentConfig
 
     # State abstraction
     abstraction_threshold::Float64 = 0.95
-
-    # Intrinsic motivation
-    use_intrinsic_reward::Bool = true
-    intrinsic_scale::Float64 = 0.1
 
     # Learning mechanism frequencies (computational efficiency tuning)
     # All mechanisms run unconditionally; these control HOW OFTEN
@@ -765,7 +771,7 @@ function act!(agent::BayesianAgent)
 
     # Snapshot top reward posterior means and oracle beliefs for decision logging
     _top_reward_means = sort(
-        [a => let rd = reward_dist(agent.model, s, a); μ = Distributions.mean(rd); isfinite(μ) ? μ : 0.0 end
+        [a => let rd = reward_dist(agent.model, s, a); μ = _reward_mean(rd); isfinite(μ) ? μ : 0.0 end
          for a in available_actions],
         by=last, rev=true
     )[1:min(3, length(available_actions))]
@@ -1119,7 +1125,7 @@ catch e
 end
 
 # Stage 1: MVBN exports
-export DirichletCategorical, update!, predict, entropy, expected_entropy, mode
+export DirichletCategorical, update!, predict, entropy, mode
 export MinimalState, extract_minimal_state
 export StateBelief, add_object!, update_from_state!, sample_state, predict_state, posterior_prob, loglikelihood
 export FactoredWorldModel, SampledFactoredDynamics, add_location!, sample_next_state, mark_selfloop!, is_selfloop, observable_key
@@ -1146,12 +1152,10 @@ export discover_schemas, apply_schema, zero_shot_transfer_likelihood
 # Stage 5: Goal-Directed Planning exports
 export Goal, extract_goals_from_text, compute_goal_progress, expected_goal_progress
 export goal_biased_action_selection, update_goal_status!
-export intrinsic_motivation_reward
-export ValueOfInformation, compute_voi_for_query
 
 # Legacy exports
 export GridWorld, spawn_food!
-export TabularWorldModel, NormalGammaPosterior, SampledDynamics, get_reward, information_gain
+export TabularWorldModel, NormalGammaPosterior, NormalGammaMeasure, SampledDynamics, get_reward
 export ThompsonMCTS, MCTSNode, plan_with_priors, select_rollout_action
 export IdentityAbstractor, BisimulationAbstractor, MinimalStateAbstractor, abstraction_summary
 export BinarySensor, LLMSensor, format_observation_for_llm, query_selection, update_beliefs_from_selection!, is_null_outcome, StateAnalysis, query_state_analysis, parse_state_analysis, apply_state_analysis_priors!, selection_accuracy, analysis_accuracy

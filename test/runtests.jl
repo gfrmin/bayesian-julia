@@ -13,7 +13,7 @@ using Test
 using BayesianAgents
 using Distributions
 using Random
-import BayesianAgents: entropy, mode, predict  # Resolve naming conflicts from Distributions
+import BayesianAgents: entropy, mode, predict  # Resolve naming conflicts
 
 Random.seed!(42)  # Reproducibility
 

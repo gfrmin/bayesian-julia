@@ -196,26 +196,6 @@ end
         @test any(g -> g.achieved, goals)
     end
 
-    @testset "Intrinsic Motivation" begin
-        model = FactoredWorldModel()
-        add_location!(model, "Room1")
-        add_object!(model, "key")
-
-        reward = intrinsic_motivation_reward(model)
-        @test reward >= 0.0
-        @test reward <= 0.2
-    end
-
-    @testset "VOI Computation" begin
-        model = FactoredWorldModel()
-        add_location!(model, "Room")
-        add_object!(model, "key")
-
-        voi = compute_voi_for_query("structure", model; cost=0.01)
-
-        @test voi.voi >= 0.0
-        @test voi.cost == 0.01
-    end
 end
 
 # ============================================================================

@@ -2,7 +2,9 @@
     ConditionalProbabilityDistribution (CPD)
 
 Represents P(V | parents) for a discrete variable V.
-Uses Dirichlet-Categorical conjugate pair for efficient Bayesian updates.
+Thin wrapper around credence's DirichletMeasure, preserving the mutable
+update!/predict/rand interface for compatibility with bayesian-julia's
+agent loop while delegating all inference to credence.
 
 Mathematical foundations:
 - Prior: θ ~ Dirichlet(α)
@@ -14,25 +16,33 @@ Mathematical foundations:
 """
     DirichletCategorical
 
-Dirichlet-Categorical conjugate pair: maintains Dirichlet posterior over
-categorical parameters θ = [θ₁, θ₂, ..., θₖ] where Σθᵢ = 1.
+Mutable wrapper around credence's immutable DirichletMeasure.
+The measure field holds the current posterior (prior alpha merged with counts).
+The prior_alpha field stores the original prior for loglikelihood reconstruction.
 
 Fields:
-- alpha::Vector{Float64}       # Dirichlet concentration parameters α
-- counts::Vector{Int}          # Empirical counts from observations
 - domain::Vector              # Possible values for this variable
+- measure::DirichletMeasure   # Credence type: posterior over simplex
+- kernel::Kernel              # Categorical kernel (Simplex → Finite) built once
+- prior_alpha::Vector{Float64} # Original prior for loglikelihood computation
 """
 mutable struct DirichletCategorical
     domain::Vector              # Possible values: [v₁, v₂, ..., vₖ]
-    alpha::Vector{Float64}      # Prior: Dirichlet(α)
-    counts::Vector{Int}         # Observed counts: count[i] = #{times V=domain[i]}
+    measure::DirichletMeasure   # Credence: holds posterior alpha (prior + counts merged)
+    kernel::Kernel              # Categorical kernel for condition/draw
+    prior_alpha::Vector{Float64} # Original prior alpha for loglikelihood
 
     function DirichletCategorical(domain::Vector, alpha::Vector{Float64})
         @assert length(domain) == length(alpha) "domain and alpha must have same length"
         @assert all(alpha .> 0) "alpha must be positive (Dirichlet support)"
 
-        counts = zeros(Int, length(domain))
-        new(domain, alpha, counts)
+        k = length(domain)
+        cats = Finite(domain)
+        measure = DirichletMeasure(Simplex(k), cats, copy(alpha))
+        kernel = Kernel(Simplex(k), cats,
+            θ -> (o -> begin; idx = findfirst(==(o), cats.values); log(θ[idx]); end),
+            (θ, o) -> begin; idx = findfirst(==(o), cats.values); log(θ[idx]); end)
+        new(domain, measure, kernel, copy(alpha))
     end
 end
 
@@ -46,11 +56,36 @@ function DirichletCategorical(domain::Vector, alpha_scalar::Float64)
     DirichletCategorical(domain, alpha)
 end
 
+# Backward-compatible property access: cpd.alpha and cpd.counts
+# Tests access these fields directly
+function Base.getproperty(cpd::DirichletCategorical, name::Symbol)
+    if name === :alpha
+        return cpd.prior_alpha
+    elseif name === :counts
+        return round.(Int, getfield(cpd, :measure).alpha .- getfield(cpd, :prior_alpha))
+    else
+        return getfield(cpd, name)
+    end
+end
+
+function Base.setproperty!(cpd::DirichletCategorical, name::Symbol, value)
+    if name === :measure || name === :prior_alpha
+        setfield!(cpd, name, value)
+    elseif name === :counts
+        # Reconstruct measure from prior_alpha + new counts
+        new_alpha = getfield(cpd, :prior_alpha) .+ Float64.(value)
+        domain = getfield(cpd, :domain)
+        setfield!(cpd, :measure, DirichletMeasure(Simplex(length(domain)), Finite(domain), new_alpha))
+    else
+        setfield!(cpd, name, value)
+    end
+end
+
 """
     update!(cpd::DirichletCategorical, observation)
 
 Update posterior with an observation.
-Finds value in domain, increments corresponding count.
+Delegates to credence's condition().
 """
 function update!(cpd::DirichletCategorical, observation)
     idx = findfirst(v -> v == observation, cpd.domain)
@@ -58,7 +93,7 @@ function update!(cpd::DirichletCategorical, observation)
         @warn "Observation $observation not in domain $(cpd.domain)"
         return
     end
-    cpd.counts[idx] += 1
+    cpd.measure = condition(cpd.measure, cpd.kernel, observation)
 end
 
 """
@@ -67,50 +102,55 @@ end
 Compute posterior predictive distribution P(V=v | data).
 Returns normalized probabilities for each value in domain.
 
-Formula: P(V=vᵢ | data) = (α_i + count_i) / (Σα + Σcount)
+Formula: P(V=vᵢ | data) = αᵢ / Σα (where α includes prior + counts)
 """
 function predict(cpd::DirichletCategorical)::Vector{Float64}
-    posterior_alpha = cpd.alpha + cpd.counts
-    return posterior_alpha / sum(posterior_alpha)
+    return weights(cpd.measure)
 end
 
 """
-    sample(cpd::DirichletCategorical) → value
+    rand(cpd::DirichletCategorical) → value
 
 Sample from posterior predictive distribution.
-1. Sample θ ~ Dirichlet(α + counts)
-2. Sample V ~ Categorical(θ)
+Uses credence's push_measure for posterior predictive sampling:
+draws directly from the predictive (one draw, weights α/Σα).
 """
 function Random.rand(cpd::DirichletCategorical)
-    theta = rand(Distributions.Dirichlet(cpd.alpha + cpd.counts))
-    value_idx = rand(Distributions.Categorical(theta))
-    return cpd.domain[value_idx]
+    # Posterior predictive: single draw from categorical with weights α/Σα
+    pred = push_measure(cpd.measure, cpd.kernel)
+    return draw(pred)
 end
 
 """
-    loglikelihood(cpd::DirichletCategorical, observations::Vector) → Float64
+    loglikelihood(cpd::DirichletCategorical) → Float64
 
 Compute log marginal likelihood log P(data | prior).
-Used for model comparison (BIC scoring).
+Uses credence's log_predictive in a sequential loop.
 
-Formula: log P(data | V) = log ∫ P(data | θ) P(θ | α) dθ
-                         = Σᵢ [log Γ(αᵢ + countᵢ) - log Γ(αᵢ)]
-                           + log Γ(Σα) - log Γ(Σα + n)
+Since Dirichlet-Categorical is exchangeable, observation order doesn't matter —
+the marginal likelihood is invariant to ordering. We iterate over counts
+synthetically (any ordering gives the same result).
 """
 function loglikelihood(cpd::DirichletCategorical)::Float64
-    alpha_sum = sum(cpd.alpha)
-    count_sum = sum(cpd.counts)
-
-    # Normalization constant
-    log_z = loggamma(alpha_sum) - loggamma(alpha_sum + count_sum)
-
-    # Per-value term
-    log_ll = 0.0
-    for i in eachindex(cpd.domain)
-        log_ll += loggamma(cpd.alpha[i] + cpd.counts[i]) - loggamma(cpd.alpha[i])
+    counts = _counts(cpd)
+    count_sum = sum(counts)
+    if count_sum == 0
+        return 0.0
     end
 
-    return log_z + log_ll
+    # Reconstruct prior measure and iterate log_predictive + condition
+    log_ml = 0.0
+    current = DirichletMeasure(Simplex(length(cpd.domain)), Finite(cpd.domain), copy(cpd.prior_alpha))
+    k = cpd.kernel
+
+    for i in eachindex(cpd.domain)
+        for _ in 1:counts[i]
+            obs = cpd.domain[i]
+            log_ml += log_predictive(current, k, obs)
+            current = condition(current, k, obs)
+        end
+    end
+    return log_ml
 end
 
 """
@@ -118,32 +158,10 @@ end
 
 Compute Shannon entropy of posterior predictive distribution.
 H[V | data] = -Σᵢ P(V=vᵢ) log P(V=vᵢ)
-
-High entropy → uncertain predictions. Drives exploration in planning.
 """
 function entropy(cpd::DirichletCategorical)::Float64
-    probs = predict(cpd)
+    probs = weights(cpd.measure)
     return -sum(probs .* log.(probs .+ 1e-10))
-end
-
-"""
-    expected_entropy(cpd::DirichletCategorical) → Float64
-
-Expected entropy of θ over the posterior distribution.
-E[H[θ]] = E[-Σᵢ θᵢ log θᵢ]
-
-Used to compute information gain and exploration bonus.
-"""
-function expected_entropy(cpd::DirichletCategorical)::Float64
-    alpha = cpd.alpha + cpd.counts
-    alpha_sum = sum(alpha)
-
-    # Dirichlet expected entropy
-    h = loggamma(alpha_sum) - sum(loggamma.(alpha))
-    h += sum((alpha_sum .- alpha) .* digamma.(alpha))
-    h /= alpha_sum
-
-    return h
 end
 
 """
@@ -152,8 +170,7 @@ end
 Return the mode (maximum a posteriori estimate) of posterior.
 """
 function mode(cpd::DirichletCategorical)
-    posterior_alpha = cpd.alpha + cpd.counts
-    max_idx = argmax(posterior_alpha)
+    max_idx = argmax(cpd.measure.alpha)
     return cpd.domain[max_idx]
 end
 
@@ -163,8 +180,9 @@ end
 Create a deep copy of the CPD.
 """
 function Base.copy(cpd::DirichletCategorical)
-    new_cpd = DirichletCategorical(copy(cpd.domain), copy(cpd.alpha))
-    new_cpd.counts = copy(cpd.counts)
+    new_cpd = DirichletCategorical(copy(cpd.domain), copy(cpd.prior_alpha))
+    # Set the measure to match current posterior
+    new_cpd.measure = DirichletMeasure(Simplex(length(cpd.domain)), Finite(copy(cpd.domain)), copy(cpd.measure.alpha))
     return new_cpd
 end
 
@@ -174,7 +192,7 @@ end
 Reset to prior (clear all observations).
 """
 function reset!(cpd::DirichletCategorical)
-    fill!(cpd.counts, 0)
+    cpd.measure = DirichletMeasure(Simplex(length(cpd.domain)), Finite(cpd.domain), copy(cpd.prior_alpha))
 end
 
-export DirichletCategorical, update!, predict, entropy, expected_entropy, mode
+export DirichletCategorical, update!, predict, entropy, mode

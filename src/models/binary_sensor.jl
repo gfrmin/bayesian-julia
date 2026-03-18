@@ -2,30 +2,36 @@
     BinarySensor
 
 A yes/no sensor with learned reliability (TPR and FPR).
-Uses Beta posteriors for both true positive rate and false positive rate.
+Uses credence's BetaMeasure for both true positive rate and false positive rate posteriors.
 """
 
 using Distributions
+
+# Bernoulli kernel for Beta-Bernoulli conjugate updates via credence
+const _BERNOULLI_KERNEL = Kernel(
+    Interval(0.0, 1.0),
+    Finite([true, false]),
+    θ -> (o -> o == true ? log(θ) : log(1.0 - θ)),
+    (θ, o) -> o == true ? log(θ) : log(1.0 - θ))
 
 """
     BinarySensor
 
 A sensor that provides binary (yes/no) answers with learnable reliability.
+Uses credence's BetaMeasure for TPR and FPR posteriors.
 """
 mutable struct BinarySensor <: Sensor
     name::String
-    
-    # TPR: P(yes | true) ~ Beta(tp_α, tp_β)
-    tp_α::Float64
-    tp_β::Float64
-    
-    # FPR: P(yes | false) ~ Beta(fp_α, fp_β)
-    fp_α::Float64
-    fp_β::Float64
-    
+
+    # TPR: P(yes | true) ~ Beta(α, β) via credence
+    tp_measure::BetaMeasure
+
+    # FPR: P(yes | false) ~ Beta(α, β) via credence
+    fp_measure::BetaMeasure
+
     # Query function: (state, question) → Bool
     query_fn::Function
-    
+
     # Statistics
     n_queries::Int
     n_correct::Int
@@ -48,8 +54,8 @@ function BinarySensor(
 )
     return BinarySensor(
         name,
-        tp_prior[1], tp_prior[2],
-        fp_prior[1], fp_prior[2],
+        BetaMeasure(tp_prior[1], tp_prior[2]),
+        BetaMeasure(fp_prior[1], fp_prior[2]),
         query_fn,
         0, 0
     )
@@ -68,43 +74,44 @@ end
 """
     tpr(sensor::BinarySensor) → Float64
 
-Return the expected true positive rate: E[P(yes | true)].
+Return the expected true positive rate: E[P(yes | true)] via credence's mean().
 """
 function tpr(sensor::BinarySensor)
-    return sensor.tp_α / (sensor.tp_α + sensor.tp_β)
+    return mean(sensor.tp_measure)
 end
 
 """
     fpr(sensor::BinarySensor) → Float64
 
-Return the expected false positive rate: E[P(yes | false)].
+Return the expected false positive rate: E[P(yes | false)] via credence's mean().
 """
 function fpr(sensor::BinarySensor)
-    return sensor.fp_α / (sensor.fp_α + sensor.fp_β)
+    return mean(sensor.fp_measure)
 end
 
 """
-    tpr_dist(sensor::BinarySensor) → Beta
+    tpr_dist(sensor::BinarySensor) → BetaMeasure
 
 Return the full posterior distribution over TPR.
 """
 function tpr_dist(sensor::BinarySensor)
-    return Beta(sensor.tp_α, sensor.tp_β)
+    return sensor.tp_measure
 end
 
 """
-    fpr_dist(sensor::BinarySensor) → Beta
+    fpr_dist(sensor::BinarySensor) → BetaMeasure
 
 Return the full posterior distribution over FPR.
 """
 function fpr_dist(sensor::BinarySensor)
-    return Beta(sensor.fp_α, sensor.fp_β)
+    return sensor.fp_measure
 end
 
 """
     update_reliability!(sensor::BinarySensor, said_yes::Bool, actual::Bool)
 
 Update the sensor's reliability estimates from ground truth.
+Uses credence's condition() for Beta-Bernoulli conjugate update.
 
 Arguments:
 - said_yes: What the sensor predicted
@@ -112,19 +119,15 @@ Arguments:
 """
 function update_reliability!(sensor::BinarySensor, said_yes::Bool, actual::Bool)
     if actual
-        # Ground truth was positive
+        # Ground truth was positive — update TPR posterior
+        sensor.tp_measure = condition(sensor.tp_measure, _BERNOULLI_KERNEL, said_yes)
         if said_yes
-            sensor.tp_α += 1  # True positive
             sensor.n_correct += 1
-        else
-            sensor.tp_β += 1  # False negative
         end
     else
-        # Ground truth was negative
-        if said_yes
-            sensor.fp_α += 1  # False positive
-        else
-            sensor.fp_β += 1  # True negative
+        # Ground truth was negative — update FPR posterior
+        sensor.fp_measure = condition(sensor.fp_measure, _BERNOULLI_KERNEL, said_yes)
+        if !said_yes
             sensor.n_correct += 1
         end
     end
@@ -136,12 +139,13 @@ end
 Compute the posterior probability that the proposition is true,
 given the prior and the sensor's answer.
 
-Uses Bayes' rule: P(true | answer) = P(answer | true) P(true) / P(answer)
+Uses Bayes' rule with expected TPR/FPR: P(true | answer) = P(answer | true) P(true) / P(answer).
+This is a scalar computation on the expected TPR/FPR — consumer code, not inference.
 """
 function posterior(sensor::BinarySensor, prior::Float64, answer::Bool)
     t = tpr(sensor)
     f = fpr(sensor)
-    
+
     if answer  # Sensor said "yes"
         numerator = t * prior
         denominator = t * prior + f * (1 - prior)
@@ -149,7 +153,7 @@ function posterior(sensor::BinarySensor, prior::Float64, answer::Bool)
         numerator = (1 - t) * prior
         denominator = (1 - t) * prior + (1 - f) * (1 - prior)
     end
-    
+
     return denominator > 0 ? numerator / denominator : prior
 end
 
@@ -170,8 +174,8 @@ Return a human-readable summary of the sensor's reliability.
 function reliability_summary(sensor::BinarySensor)
     return """
     Sensor: $(sensor.name)
-      TPR: $(round(tpr(sensor), digits=3)) [Beta($(sensor.tp_α), $(sensor.tp_β))]
-      FPR: $(round(fpr(sensor), digits=3)) [Beta($(sensor.fp_α), $(sensor.fp_β))]
+      TPR: $(round(tpr(sensor), digits=3)) [Beta($(sensor.tp_measure.alpha), $(sensor.tp_measure.beta))]
+      FPR: $(round(fpr(sensor), digits=3)) [Beta($(sensor.fp_measure.alpha), $(sensor.fp_measure.beta))]
       Queries: $(sensor.n_queries)
       Accuracy: $(round(accuracy(sensor), digits=3))
     """
@@ -186,15 +190,14 @@ end
 
 A binary sensor backed by a large language model.
 Wraps an LLM client and converts questions to yes/no queries.
+Uses credence's BetaMeasure for TPR/FPR posteriors.
 """
 mutable struct LLMSensor <: Sensor
     name::String
 
-    # Reliability tracking (same as BinarySensor)
-    tp_α::Float64
-    tp_β::Float64
-    fp_α::Float64
-    fp_β::Float64
+    # Reliability tracking via credence's BetaMeasure
+    tp_measure::BetaMeasure
+    fp_measure::BetaMeasure
 
     # LLM interface
     llm_client::Any  # Duck-typed: must have query(client, prompt) → String
@@ -229,8 +232,8 @@ function LLMSensor(
 )
     return LLMSensor(
         name,
-        tp_prior[1], tp_prior[2],
-        fp_prior[1], fp_prior[2],
+        BetaMeasure(tp_prior[1], tp_prior[2]),
+        BetaMeasure(fp_prior[1], fp_prior[2]),
         llm_client,
         prompt_template,
         0, 0,
@@ -323,23 +326,19 @@ function query(sensor::LLMSensor, state, question::String; action_history=nothin
     end
 end
 
-# Inherit reliability methods from BinarySensor
-tpr(s::LLMSensor) = s.tp_α / (s.tp_α + s.tp_β)
-fpr(s::LLMSensor) = s.fp_α / (s.fp_α + s.fp_β)
+# Reliability methods for LLMSensor — use credence's mean()
+tpr(s::LLMSensor) = mean(s.tp_measure)
+fpr(s::LLMSensor) = mean(s.fp_measure)
 
 function update_reliability!(sensor::LLMSensor, said_yes::Bool, actual::Bool)
     if actual
+        sensor.tp_measure = condition(sensor.tp_measure, _BERNOULLI_KERNEL, said_yes)
         if said_yes
-            sensor.tp_α += 1
             sensor.n_correct += 1
-        else
-            sensor.tp_β += 1
         end
     else
-        if said_yes
-            sensor.fp_α += 1
-        else
-            sensor.fp_β += 1
+        sensor.fp_measure = condition(sensor.fp_measure, _BERNOULLI_KERNEL, said_yes)
+        if !said_yes
             sensor.n_correct += 1
         end
     end
@@ -437,11 +436,6 @@ end
 Apply Bayesian update to action beliefs based on state analysis.
 Promising directions boost action beliefs using the analysis-specific accuracy
 (separate from binary TPR/FPR and selection accuracy).
-
-The boost treats analysis as a binary observation per action:
-    P(action is best | analysis says promising) ∝ α_analysis × prior
-    P(action is best | analysis says not promising) ∝ (1 - α_analysis) × prior
-where α_analysis is the learned analysis accuracy.
 """
 function apply_state_analysis_priors!(analysis::StateAnalysis, actions, action_beliefs::Dict, sensor)
     promising_lower = [lowercase(d) for d in analysis.promising_directions]
